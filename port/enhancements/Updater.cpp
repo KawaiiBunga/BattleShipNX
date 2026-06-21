@@ -237,6 +237,9 @@ void ResetDownloadStateForNewCheck() {
 } // namespace
 
 void CheckForUpdatesAsync(bool force) {
+#if defined(__SWITCH__)
+    return;
+#endif
     // Check our atomic flags (no locks required)
     if (s_isCheckingForUpdates.load() || s_isDownloading.load()) return;
     if (!force && s_updateChecked.load()) return;
@@ -248,6 +251,7 @@ void CheckForUpdatesAsync(bool force) {
     ResetDownloadStateForNewCheck();
     SetUpdateStatus("");
 
+#if !defined(__SWITCH__)
     std::thread([]() {
         std::string response;
         int exitCode = RunCapture(BuildCheckCommand(), [&](const std::string& line) {
@@ -301,9 +305,13 @@ void CheckForUpdatesAsync(bool force) {
 
         s_isCheckingForUpdates.store(false);
     }).detach();
+#endif
 }
 
 void StartGameUpdate() {
+#if defined(__SWITCH__)
+    return;
+#endif
     if (s_isDownloading.load()) return;
     s_isDownloading.store(true);
 
@@ -317,6 +325,7 @@ void StartGameUpdate() {
         s_downloadStatus = "Initializing download...";
     }
 
+#if !defined(__SWITCH__)
     std::thread([]() {
         std::string url;
         {
@@ -453,10 +462,14 @@ void StartGameUpdate() {
 
         s_isDownloading.store(false);
     }).detach();
+#endif
 }
 
 // OS-aware URL opener for Windows and Mac fallback
 void OpenReleasePage() {
+#if defined(__SWITCH__)
+    return;
+#endif
     const char* url = kReleasePageUrl;
 
     #if defined(_WIN32)

@@ -13,7 +13,7 @@
  * drift at compile time.
  */
 
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(__SWITCH__)
 
 #if !defined(__aarch64__)
 #  error "Android coroutine backend currently supports arm64-v8a only. "  \
@@ -28,7 +28,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#if defined(__SWITCH__)
+#include <malloc.h>
+#else
 #include <sys/mman.h>
+#endif
 #include <unistd.h>
 
 #define MIN_STACK_SIZE 32768
@@ -108,6 +112,16 @@ PortCoroutine *port_coroutine_create(void (*entry)(void *), void *arg, size_t st
      * coroutine stack overflow faults immediately instead of silently
      * corrupting adjacent heap. mmap returns page-aligned memory, which
      * satisfies AAPCS64's 16-byte sp alignment requirement. */
+#if defined(__SWITCH__)
+    size_t ps = 4096;
+    stack_size = (stack_size + ps - 1) & ~(ps - 1);
+    co->stack_total = stack_size;
+    void *stk = memalign(16, co->stack_total);
+    if (!stk) {
+        free(co);
+        return nullptr;
+    }
+#else
     long ps_v = sysconf(_SC_PAGESIZE);
     size_t ps = (ps_v > 0) ? (size_t)ps_v : 4096;
     stack_size = (stack_size + ps - 1) & ~(ps - 1);
@@ -119,6 +133,7 @@ PortCoroutine *port_coroutine_create(void (*entry)(void *), void *arg, size_t st
         return nullptr;
     }
     mprotect(stk, ps, PROT_NONE);
+#endif
     co->stack_mem  = stk;
     co->entry      = entry;
     co->arg        = arg;
@@ -144,7 +159,11 @@ void port_coroutine_destroy(PortCoroutine *co) {
         abort();
     }
     if (co->stack_mem) {
+#if defined(__SWITCH__)
+        free(co->stack_mem);
+#else
         munmap(co->stack_mem, co->stack_total);
+#endif
     }
     free(co);
 }
@@ -187,4 +206,4 @@ int port_coroutine_in_coroutine(void) {
 
 } /* extern "C" */
 
-#endif /* __ANDROID__ */
+#endif /* __ANDROID__ || __SWITCH__ */

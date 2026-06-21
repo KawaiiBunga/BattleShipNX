@@ -10,7 +10,7 @@
 #include <libultraship/libultraship.h>
 #include <libultraship/bridge.h>
 
-// Discord SDK header
+#if !defined(__SWITCH__)
 #include <discord_rpc.h>
 
 #define DISCORD_CLIENT_ID "1503877021615390741"
@@ -72,6 +72,7 @@ static void DRP_Shutdown() {
 
     g_drpInitialized = false;
 }
+#endif // !__SWITCH__
 
 // ---------------------------------------------------------
 // PUBLIC FUNCTIONS
@@ -81,6 +82,7 @@ namespace ssb64 {
     namespace enhancements {
 
         void UpdateDiscordPresence(const char* gameState, const char* matchDetails) {
+#if !defined(__SWITCH__)
             bool isDRPEnabled = CVarGetInteger("gSettings.Menu.EnableDRP", 0) != 0;
 
             if (!isDRPEnabled) {
@@ -107,8 +109,10 @@ namespace ssb64 {
             discordPresence.largeImageText = "Unofficial Smash 64 PC Port";
 
             Discord_UpdatePresence(&discordPresence);
+#endif
         }
 
+#if !defined(__SWITCH__)
         static void UpdatePresenceForScene(unsigned char sceneId) {
             switch (sceneId) {
                 // --- MENUS ---
@@ -183,8 +187,10 @@ namespace ssb64 {
                     break;
             }
         }
+#endif
 
         void TickDiscordPresence() {
+#if !defined(__SWITCH__)
             // 1. Read the menu toggle
             bool isDRPEnabled = CVarGetInteger("gSettings.Menu.EnableDRP", 0) != 0;
 
@@ -213,6 +219,7 @@ namespace ssb64 {
                 // Reset our tracker so it updates instantly if they check the box again
                 s_lastScene = 255;
             }
+#endif
         }
 
     } // namespace enhancements

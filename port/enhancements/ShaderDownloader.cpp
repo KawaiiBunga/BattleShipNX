@@ -325,6 +325,9 @@ bool ReferencesUnsupportedHistoryBinding(const std::string& source) {
 // flags (`-s` on curl, `-q` on unzip) — but the FILE* still needs to
 // be drained so the child doesn't block on a full pipe.
 bool RunSilent(const std::string& cmd) {
+#if defined(__SWITCH__)
+    return false;
+#else
 #if defined(_WIN32)
     FILE* pipe = _popen(cmd.c_str(), "r");
 #else
@@ -349,6 +352,7 @@ bool RunSilent(const std::string& cmd) {
         SPDLOG_ERROR("Shader pack: command failed (exit={}): `{}`", rc, cmd);
     }
     return rc == 0;
+#endif
 }
 
 // Format a filesystem path for inclusion in a shell command line.

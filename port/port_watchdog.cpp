@@ -12,7 +12,7 @@
 #include <cstdio>
 #include <thread>
 
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__SWITCH__)
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
@@ -53,7 +53,7 @@ std::atomic<bool>     sShutdown{false};
 std::atomic<bool>     sStarted{false};
 std::thread           sWatchdogThread;
 
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__SWITCH__)
 pthread_t             sMainThread;
 std::atomic<bool>     sBacktraceRequested{false};
 std::atomic<bool>     sBacktraceDone{false};
@@ -458,7 +458,7 @@ void WatchdogLoop() {
                          (unsigned long long)yc);
             std::fflush(stderr);
 
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__SWITCH__)
             /* Ask the main thread to dump its own backtrace via SIGUSR1. One
              * dump per hang is enough — clearing sBacktraceDone lets the next
              * distinct hang dump again. */
@@ -485,7 +485,7 @@ void WatchdogLoop() {
 extern "C" void port_watchdog_init(void) {
     bool expected = false;
     if (!sStarted.compare_exchange_strong(expected, true)) return;
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__SWITCH__)
     sMainThread = pthread_self();
 
     /* Self-pipe for ProbeReadable (see comment there). Created up front
@@ -576,7 +576,7 @@ extern "C" void port_watchdog_note_frame_end(void) {
     sFrameCount.fetch_add(1, std::memory_order_relaxed);
 }
 
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__SWITCH__)
 extern "C" void port_dump_backtrace(void) {
     DumpBacktraceBoth();
 }

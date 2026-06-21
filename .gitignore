@@ -112,3 +112,21 @@ debug_traces/
 # Local extraction / scratch directories used during debugging
 extract/
 test.zip
+
+# Switch / Build artifacts
+*.nro
+*.elf
+*.nacp
+*.map
+
+# Agent Artifacts
+CHANGELOG.md
+PORTING_PLAN.md
+PROJECT_OVERVIEW.md
+RISKS.md
+TASKS.md
+TESTING_PLAN.md
+build_venv/
+build_venv_win/
+get-pip.py
+test.c

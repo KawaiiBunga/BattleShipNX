@@ -75,6 +75,25 @@ Use `--config Debug` (and run `.\build\<ver>\Debug\BattleShip.exe`) for a
 debug build. CMake auto-detects the newest installed Visual Studio; pin
 it with `-G "Visual Studio 17 2022" -T v143` if a runner has several.
 
+## Nintendo Switch
+
+Nintendo Switch builds require the [devkitPro](https://devkitpro.org/) toolchain with `devkitA64` and `libnx` installed.
+
+1. Ensure your devkitPro environment variables are set.
+2. From an MSYS2 or Linux shell, configure using the Switch toolchain file:
+
+```bash
+cmake -S . -B build-switch -DCMAKE_TOOLCHAIN_FILE=/opt/devkitpro/cmake/Switch.cmake -DSSB64_VERSION=us
+```
+
+3. Build the NRO (compiles `BattleShip.elf`, generates `BattleShip.nacp`, and packages `BattleShip.nro`):
+
+```bash
+cmake --build build-switch -j
+```
+
+*Note: The NRO does not bundle `BattleShip.o2r` inside a RomFS. You must extract `BattleShip.o2r` using a PC build first and place it alongside `BattleShip.nro` on your SD card, along with `f3d.o2r`, `gamecontrollerdb.txt`, `assets/`, and `yamls/`.*
+
 ## Notes
 
 - Each version's assets and binary live entirely in that version's build

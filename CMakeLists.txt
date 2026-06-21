@@ -5,8 +5,19 @@ project(ssb64 LANGUAGES C CXX)
 # Android needs ASM for the aarch64 coroutine context-switch
 # (port/coroutine_aarch64.S). Enable it before any add_library/add_executable
 # call sees an .S source. ASM is preprocessed by clang on the way through.
-if (CMAKE_SYSTEM_NAME STREQUAL "Android")
+if (CMAKE_SYSTEM_NAME MATCHES "Android|NintendoSwitch")
     enable_language(ASM)
+endif()
+
+if (WIN32 OR CMAKE_SYSTEM_NAME MATCHES "NintendoSwitch")
+    # Prevent "argument list too long" when linking large executables on Windows
+    set(CMAKE_CXX_USE_RESPONSE_FILE_FOR_OBJECTS 1)
+    set(CMAKE_C_USE_RESPONSE_FILE_FOR_OBJECTS 1)
+endif()
+
+if (CMAKE_SYSTEM_NAME MATCHES "NintendoSwitch")
+    # Nintendo Switch libnx lacks waitpid/execvp needed by ImGui's shell fallback
+    add_compile_definitions(IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS)
 endif()
 
 # Mod system master switch (TinyCC source scripting + funchook hook backend +
@@ -15,7 +26,7 @@ endif()
 # and the in-engine call sites (#ifndef DISABLE_SCRIPTING). Forced ON for
 # Android: funchook/TinyCC have no Android target and the loader is desktop-only.
 # Set BEFORE add_subdirectory(libultraship) so the engine half sees it too.
-if (CMAKE_SYSTEM_NAME STREQUAL "Android")
+if (CMAKE_SYSTEM_NAME MATCHES "Android|NintendoSwitch")
     set(DISABLE_SCRIPTING ON CACHE BOOL "Disable the mod system (scripting + hooks)" FORCE)
 endif()
 if (DISABLE_SCRIPTING)
@@ -125,7 +136,7 @@ set(GBI_UCODE "F3DEX_GBI_2" CACHE STRING "" FORCE)
 # Android needs GLES3 instead of desktop GL + GLEW. Pin USE_OPENGLES ON
 # before the libultraship subdirectory so its src/CMakeLists.txt picks the
 # GLESv3 branch and the ENABLE_OPENGL/USE_OPENGLES compile defs are set.
-if (CMAKE_SYSTEM_NAME STREQUAL "Android")
+if (CMAKE_SYSTEM_NAME MATCHES "Android|NintendoSwitch")
     set(USE_OPENGLES ON CACHE BOOL "" FORCE)
 endif()
 
@@ -135,6 +146,8 @@ endif()
 # see the torch_runner target at the bottom of this file.
 if (CMAKE_SYSTEM_NAME STREQUAL "Android")
     set(USE_STANDALONE OFF CACHE BOOL "" FORCE)
+elseif (CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+    # Switch does not build torch; it relies on PC extraction.
 else()
     set(USE_STANDALONE ON CACHE BOOL "" FORCE)
 endif()
@@ -218,6 +231,10 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Android")
     # was forced above). The libtorch_runner.so SHARED library at the
     # bottom of this file wraps it for JNI.
     add_subdirectory(torch ${CMAKE_BINARY_DIR}/torch)
+elseif (CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+    # Switch: no Torch built. Rely on PC for extraction.
+    set(TORCH_EXECUTABLE "torch")
+    set(TORCH_SIDECAR_NAME torch)
 else()
     # Desktop: build Torch as a host executable via ExternalProject so it
     # can run at our build time to extract ROM assets.
@@ -747,7 +764,7 @@ endif()
 # Fetch Discord RPC (desktop only — Android drops Discord Rich Presence
 # along with the rest of the network-dependent features).
 ################################################################################
-if (NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
+if (NOT CMAKE_SYSTEM_NAME MATCHES "Android|NintendoSwitch")
     # discord-rpc v3.4.0's CMakeLists declares cmake_minimum_required(VERSION 2.x),
     # which CMake 3.30+ refuses to honor. Force a baseline policy version for the
     # fetched subdir so the build still configures with current CMake.
@@ -796,6 +813,14 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Android")
         port/coroutine_aarch64.S
     )
     set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "main")
+elseif (CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+    add_executable(${PROJECT_NAME}
+        ${SSB64_SRC_PORT}
+        ${SSB64_DEBUG_TOOLS}
+        $<TARGET_OBJECTS:ssb64_game>
+        port/coroutine_aarch64.S
+    )
+    set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "${SSB64_APP_NAME}")
 else()
     add_executable(${PROJECT_NAME} ${SSB64_SRC_PORT} ${SSB64_DEBUG_TOOLS} $<TARGET_OBJECTS:ssb64_game>)
 
@@ -834,13 +859,13 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/debug_tools
     ${SSB64_CSS_GEN_DIR}                         # CSS icon baked headers (arrow_data.h)
 )
-if (NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
+if (NOT CMAKE_SYSTEM_NAME MATCHES "Android|NintendoSwitch")
     target_include_directories(${PROJECT_NAME} PRIVATE
         ${SSB64_ICON_GEN_DIR}                         # Generated icon header (port_icon_data.h)
         ${discord_rpc_SOURCE_DIR}/include             # Discord Rich Presence
     )
 else()
-    # Android: include the generated dir for CSS icon baked headers.
+    # Android/Switch: include the generated dir for CSS icon baked headers.
     # (SSB64_ICON_GEN_DIR is already the same dir; listed explicitly for clarity.)
     target_include_directories(${PROJECT_NAME} PRIVATE
         ${SSB64_CSS_GEN_DIR}                          # CSS icon baked headers
@@ -851,7 +876,7 @@ endif()
 # Link libultraship and Torch
 ################################################################################
 
-if (CMAKE_SYSTEM_NAME STREQUAL "Android")
+if (CMAKE_SYSTEM_NAME MATCHES "Android|NintendoSwitch")
     add_dependencies(${PROJECT_NAME} libultraship)
     target_link_libraries(${PROJECT_NAME} PRIVATE libultraship)
 else()
@@ -996,14 +1021,20 @@ if (NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
         COMMAND ${CMAKE_COMMAND} -E copy_directory
             ${CMAKE_SOURCE_DIR}/yamls/${SSB64_VERSION}
             $<TARGET_FILE_DIR:${PROJECT_NAME}>/yamls/${SSB64_VERSION}
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${TORCH_EXECUTABLE}
-            $<TARGET_FILE_DIR:${PROJECT_NAME}>/${TORCH_SIDECAR_NAME}
+        # Torch executable is handled below conditionally
         # CSS stage asset PNGs (final_destination_background.png, etc.) are
         # copied in a separate POST_BUILD step added by the DeriveStageAssets
         # block further below, after SSB64_BASEROM is resolved.
         # Arrow data is baked into the binary via arrow_data.h / arrow_left_data.h.
     )
+
+    if (NOT CMAKE_SYSTEM_NAME MATCHES "NintendoSwitch")
+        add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${TORCH_EXECUTABLE}
+                $<TARGET_FILE_DIR:${PROJECT_NAME}>/${TORCH_SIDECAR_NAME}
+        )
+    endif()
 else()
     # Android: produce f3d.o2r in the source tree so Gradle's stageGameAssets
     # task can pick it up at APK build time. No POST_BUILD copies — the APK
@@ -1380,4 +1411,20 @@ endif()
 ################################################################################
 if (NOT DISABLE_SCRIPTING)
     include(ModO2R)
+endif()
+
+################################################################################
+# Nintendo Switch NRO generation
+################################################################################
+if(CMAKE_SYSTEM_NAME MATCHES "NintendoSwitch")
+    nx_generate_nacp(BattleShip.nacp
+       NAME "BattleShipNX"
+       AUTHOR "BattleShip Team"
+       VERSION "${BATTLESHIP_VERSION}"
+    )
+
+    nx_create_nro(${PROJECT_NAME}
+        NACP BattleShip.nacp
+        ICON ${CMAKE_CURRENT_SOURCE_DIR}/assets/icon.png
+    )
 endif()

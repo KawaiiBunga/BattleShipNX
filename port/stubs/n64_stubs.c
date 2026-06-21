@@ -789,8 +789,10 @@ void spFinish(Gfx **glistp)
 #include <stdio.h>
 #include <stdlib.h>
 
+#if !defined(__SWITCH__)
 void __assert(const char *expr, const char *file, int line)
 {
 	port_log( "Assertion failed: %s, file %s, line %d\n", expr, file, line);
 	abort();
 }
+#endif
