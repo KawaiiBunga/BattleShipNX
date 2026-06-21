@@ -614,6 +614,12 @@ static int PortInitImpl(int argc, char* argv[]) {
 
 	if (!sContext->InitConfiguration()) { port_log("SSB64: InitConfiguration failed\n"); return 1; }
 	if (!sContext->InitConsoleVariables()) { port_log("SSB64: InitConsoleVariables failed\n"); return 1; }
+#ifdef __SWITCH__
+	// Ensure the Switch port always has controller navigation enabled for the UI.
+	// This prevents console users from being permanently locked out of the menu 
+	// if they don't have a physical keyboard connected.
+	sContext->GetConsoleVariables()->SetInteger("gControlNav", 1);
+#endif
 	port_log("SSB64: Config + CVars OK\n");
 
 	/* Latch the Classic Co-op menu choice for this launch — the toggle

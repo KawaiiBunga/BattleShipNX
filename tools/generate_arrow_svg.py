@@ -40,7 +40,8 @@ from pathlib import Path
 try:
     from PIL import Image, ImageDraw
 except ImportError:
-    sys.exit("ERROR: Pillow is required.  Install with: pip install Pillow")
+    print("WARNING: Pillow is required to regenerate arrow PNGs. Skipping generation and using existing files.")
+    sys.exit(0)
 
 
 # ---------------------------------------------------------------------------

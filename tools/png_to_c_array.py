@@ -45,28 +45,33 @@ def encode_png_to_rgba16_header(src_path: str, dst_path: str,
                                  symbol_prefix: str) -> None:
     try:
         from PIL import Image
+        img = Image.open(src_path).convert("RGBA")
+        w, h = img.size
+        raw = img.tobytes()  # flat RGBA8: [r, g, b, a, r, g, b, a, ...]
+        npx = w * h
+
+        # Build the big-endian RGBA16 byte list
+        rows = []
+        for i in range(0, npx * 4, 64):  # 16 pixels = 32 bytes = 16*4 = 64 rgba8 bytes
+            chunk_rgba8 = raw[i:i + 64]
+            pixel_hex = []
+            for p in range(0, len(chunk_rgba8), 4):
+                r, g, b, a = chunk_rgba8[p], chunk_rgba8[p+1], chunk_rgba8[p+2], chunk_rgba8[p+3]
+                px = ((r >> 3) << 11) | ((g >> 3) << 6) | ((b >> 3) << 1) | (a >> 7)
+                hi = (px >> 8) & 0xFF
+                lo = px & 0xFF
+                pixel_hex.append(f"0x{hi:02x}, 0x{lo:02x}")
+            rows.append(", ".join(pixel_hex))
+
+        arr_body = ",\n    ".join(rows)
+
     except ImportError:
-        sys.exit("ERROR: Pillow is required.  Install with: pip install Pillow")
-
-    img = Image.open(src_path).convert("RGBA")
-    w, h = img.size
-    raw = img.tobytes()  # flat RGBA8: [r, g, b, a, r, g, b, a, ...]
-    npx = w * h
-
-    # Build the big-endian RGBA16 byte list
-    rows = []
-    for i in range(0, npx * 4, 64):  # 16 pixels = 32 bytes = 16*4 = 64 rgba8 bytes
-        chunk_rgba8 = raw[i:i + 64]
-        pixel_hex = []
-        for p in range(0, len(chunk_rgba8), 4):
-            r, g, b, a = chunk_rgba8[p], chunk_rgba8[p+1], chunk_rgba8[p+2], chunk_rgba8[p+3]
-            px = ((r >> 3) << 11) | ((g >> 3) << 6) | ((b >> 3) << 1) | (a >> 7)
-            hi = (px >> 8) & 0xFF
-            lo = px & 0xFF
-            pixel_hex.append(f"0x{hi:02x}, 0x{lo:02x}")
-        rows.append(", ".join(pixel_hex))
-
-    arr_body = ",\n    ".join(rows)
+        print("WARNING: Pillow missing. Generating empty transparent array.")
+        with open(src_path, "rb") as f:
+            f.seek(16)
+            w, h = struct.unpack(">II", f.read(8))
+        npx = w * h
+        arr_body = "0x00, " * (npx * 2 - 1) + "0x00"
 
     # Capitalise first letter for the C symbol
     sym = symbol_prefix[0].upper() + symbol_prefix[1:]

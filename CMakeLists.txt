@@ -13,6 +13,8 @@ if (WIN32 OR CMAKE_SYSTEM_NAME MATCHES "NintendoSwitch")
     # Prevent "argument list too long" when linking large executables on Windows
     set(CMAKE_CXX_USE_RESPONSE_FILE_FOR_OBJECTS 1)
     set(CMAKE_C_USE_RESPONSE_FILE_FOR_OBJECTS 1)
+    set(CMAKE_CXX_USE_RESPONSE_FILE_FOR_LIBRARIES 1)
+    set(CMAKE_C_USE_RESPONSE_FILE_FOR_LIBRARIES 1)
 endif()
 
 if (CMAKE_SYSTEM_NAME MATCHES "NintendoSwitch")
@@ -660,7 +662,7 @@ endif()
 # Decomp C code — OBJECT library with custom include/ shadowing system headers
 ################################################################################
 
-add_library(ssb64_game OBJECT ${SSB64_DECOMP_SOURCES})
+add_library(ssb64_game STATIC ${SSB64_DECOMP_SOURCES})
 
 # Port stub definitions (C code that satisfies N64 linker symbols)
 file(GLOB SSB64_STUBS "port/stubs/*.c")
@@ -809,7 +811,6 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Android")
     add_library(${PROJECT_NAME} SHARED
         ${SSB64_SRC_PORT}
         ${SSB64_DEBUG_TOOLS}
-        $<TARGET_OBJECTS:ssb64_game>
         port/coroutine_aarch64.S
     )
     set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "main")
@@ -817,12 +818,11 @@ elseif (CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
     add_executable(${PROJECT_NAME}
         ${SSB64_SRC_PORT}
         ${SSB64_DEBUG_TOOLS}
-        $<TARGET_OBJECTS:ssb64_game>
         port/coroutine_aarch64.S
     )
     set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "${SSB64_APP_NAME}")
 else()
-    add_executable(${PROJECT_NAME} ${SSB64_SRC_PORT} ${SSB64_DEBUG_TOOLS} $<TARGET_OBJECTS:ssb64_game>)
+    add_executable(${PROJECT_NAME} ${SSB64_SRC_PORT} ${SSB64_DEBUG_TOOLS})
 
     # User-facing binary name. The CMake target keeps the historical
     # `ssb64` identifier (matches the repo, build dirs, internal symbols),
@@ -830,6 +830,8 @@ else()
     # (US) or `BattleShip-JP` (JP), so the two are distinct applications.
     set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "${SSB64_APP_NAME}")
 endif()
+
+target_link_libraries(${PROJECT_NAME} PRIVATE ssb64_game)
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
     set_target_properties(ssb64_game PROPERTIES
@@ -1419,7 +1421,7 @@ endif()
 if(CMAKE_SYSTEM_NAME MATCHES "NintendoSwitch")
     nx_generate_nacp(BattleShip.nacp
        NAME "BattleShipNX"
-       AUTHOR "BattleShip Team"
+       AUTHOR "Kawaii"
        VERSION "${BATTLESHIP_VERSION}"
     )
 
