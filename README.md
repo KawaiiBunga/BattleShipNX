@@ -121,4 +121,6 @@ This project is **not affiliated with, endorsed by, or authorized by Nintendo.**
 
 This project is **not affiliated with, endorsed by, or authorized by JRickey** (the creator of the original PC port). Issues, bugs, and support questions about this Nintendo Switch port should **not** be directed to JRickey or the original repo.
 
+## Like what I do?
+I love what I do and want to keep sharing it with the world. You can directly support me and my projects here: https://ko-fi.com/kawaiibunga
 This project is **not affiliated with, endorsed by, or authorized by Harbour Masters** either. It uses libultraship and Torch as upstream dependencies via personal forks, but it is an independent fan effort. Issues, bugs, and support questions about this port should not be directed to the Harbour Masters team.
