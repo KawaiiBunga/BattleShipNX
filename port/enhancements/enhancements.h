@@ -94,6 +94,7 @@ const char* AnalogRemapCVarName(int playerIndex);
 const char* AnalogRemapDeadzoneCVarName(int playerIndex);
 const char* AnalogRemapRangeCVarName(int playerIndex);
 const char* WidescreenCVarName();
+const char* BonusStagesCVarName();
 const char* CompRulesetCVarName();
 const char* NeutralSpawnsCVarName();
 const char* AutoZCancelCVarName();
@@ -105,6 +106,7 @@ const char* ClassicCoopCVarName();
 const char* ClassicCoopFriendlyFireCVarName();
 const char* ShuffleMusicCVarName();
 const char* MusicSelectionCVarName();
+const char* DisableHUDCVarName();
 
 // Discord Rich Presence
 void UpdateDiscordPresence(const char* gameState, const char* matchDetails);

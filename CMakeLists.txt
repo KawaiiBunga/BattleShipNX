@@ -2,6 +2,18 @@ cmake_minimum_required(VERSION 3.24.0 FATAL_ERROR)
 
 project(ssb64 LANGUAGES C CXX)
 
+option(BATTLESHIP_UWP "Build the native DLL used by the Xbox/UWP wrapper" OFF)
+
+if(BATTLESHIP_UWP)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
+        message(FATAL_ERROR "BATTLESHIP_UWP requires a Windows x64 host build")
+    endif()
+    set(NON_PORTABLE ON CACHE BOOL "Store writable data in platform app storage" FORCE)
+    set(DISABLE_SCRIPTING ON CACHE BOOL "UWP cannot provide executable-memory scripting" FORCE)
+    set(LUS_ENABLE_POSTPROCESS_TRANSPILER OFF CACHE BOOL "UWP uses packaged shaders" FORCE)
+    add_compile_definitions(_UWP=1 BATTLESHIP_UWP=1)
+endif()
+
 # Android needs ASM for the aarch64 coroutine context-switch
 # (port/coroutine_aarch64.S). Enable it before any add_library/add_executable
 # call sees an .S source. ASM is preprocessed by clang on the way through.
@@ -31,6 +43,7 @@ endif()
 if (CMAKE_SYSTEM_NAME MATCHES "Android|NintendoSwitch")
     set(DISABLE_SCRIPTING ON CACHE BOOL "Disable the mod system (scripting + hooks)" FORCE)
 endif()
+
 if (DISABLE_SCRIPTING)
     # Define for every superproject target (ssb64_game + the exe + port glue)
     # so the #ifndef DISABLE_SCRIPTING guards in port/*.cpp engage. libultraship
@@ -122,6 +135,9 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Android" AND NOT SSB64_VERSION STREQUAL "us")
         "Android build is US-only (got SSB64_VERSION=${SSB64_VERSION}). "
         "Drop -DSSB64_VERSION=jp from the Gradle externalNativeBuild args.")
 endif()
+if (BATTLESHIP_UWP AND NOT SSB64_VERSION STREQUAL "us")
+    message(FATAL_ERROR "The UWP package supports the US ROM only")
+endif()
 string(TOUPPER "${SSB64_VERSION}" SSB64_VERSION_UC)
 message(STATUS "SSB64 ROM version: ${SSB64_VERSION}")
 
@@ -162,6 +178,14 @@ set(BUILD_FZERO OFF CACHE BOOL "" FORCE)
 set(BUILD_MARIO_ARTIST OFF CACHE BOOL "" FORCE)
 set(BUILD_NAUDIO ON CACHE BOOL "" FORCE)
 set(BUILD_SSB64 ON CACHE BOOL "" FORCE)
+
+if(BATTLESHIP_UWP)
+    FetchContent_Declare(UwpLibs
+        GIT_REPOSITORY https://github.com/worleydl/uwp-dep.git
+        GIT_TAG 0ec87d2406b47743772e2787654275a6f6c0e284
+    )
+    FetchContent_MakeAvailable(UwpLibs)
+endif()
 
 ################################################################################
 # Subdirectories: libultraship
@@ -393,6 +417,49 @@ set(SSB64_CSS_ARROW_PNG       ${CMAKE_CURRENT_SOURCE_DIR}/port/assets/css_icons/
 set(SSB64_CSS_ARROW_LEFT_PNG  ${CMAKE_CURRENT_SOURCE_DIR}/port/assets/css_icons/arrow_left.png)
 set(SSB64_CSS_ARROW_H         ${SSB64_CSS_GEN_DIR}/arrow_data.h)
 set(SSB64_CSS_ARROW_LEFT_H    ${SSB64_CSS_GEN_DIR}/arrow_left_data.h)
+
+# Baked nameplate headers for the port-introduced stages. Rendered from text
+# strings only (tools/render_nameplates.py — NO ROM data), so unlike the
+# stage icons these are legal to compile into shipped binaries. They are the
+# release fallback for portCSSGetStageNameSprite when no
+# assets/css_icons/<name>_name.png override exists; keep the strings in sync
+# with STAGES in tools/derive_stage_assets.py.
+set(SSB64_CSS_NAMEPLATES
+    "final_destination|FINAL DESTINATION|nameFinalDestination"
+    "metal_cavern|METAL CAVERN|nameMetalCavern"
+    "battlefield|BATTLEFIELD|nameBattlefield")
+set(SSB64_CSS_NAMEPLATE_HEADERS "")
+foreach(entry IN LISTS SSB64_CSS_NAMEPLATES)
+    string(REPLACE "|" ";" fields "${entry}")
+    list(GET fields 0 np_stem)
+    list(GET fields 1 np_text)
+    list(GET fields 2 np_symbol)
+    set(np_png ${SSB64_CSS_GEN_DIR}/${np_stem}_name.png)
+    set(np_h   ${SSB64_CSS_GEN_DIR}/${np_stem}_name_data.h)
+    add_custom_command(
+        OUTPUT ${np_png}
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/render_nameplates.py
+                ${np_text}
+                ${np_png}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tools/render_nameplates.py
+        COMMENT "Rendering nameplate PNG (${np_text})"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT ${np_h}
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/png_to_c_array.py
+                ${np_png}
+                ${np_h}
+                ${np_symbol}
+        DEPENDS ${np_png}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/png_to_c_array.py
+        COMMENT "Baking nameplate -> ${np_h}"
+        VERBATIM
+    )
+    list(APPEND SSB64_CSS_NAMEPLATE_HEADERS ${np_h})
+endforeach()
 add_custom_command(
     OUTPUT ${SSB64_CSS_ARROW_PNG}
     COMMAND ${Python3_EXECUTABLE}
@@ -468,7 +535,11 @@ file(GLOB_RECURSE SSB64_SRC_SYS     "decomp/src/sys/*.c"     "decomp/src/sys/*.h
 file(GLOB_RECURSE SSB64_SRC_WP      "decomp/src/wp/*.c"      "decomp/src/wp/*.h")
 
 # Port layer (C++ glue) — excludes port/stubs/ which is compiled as part of ssb64_game
-file(GLOB_RECURSE SSB64_SRC_PORT "port/*.cpp" "port/*.c" "port/*.h")
+# CONFIGURE_DEPENDS: new port TUs (e.g. a new port/enhancements/*.cpp whose
+# symbol a decomp TU references) must be picked up by already-configured build
+# dirs, or a plain `cmake --build` after pulling hits an undefined-reference
+# link error against a stale glob.
+file(GLOB_RECURSE SSB64_SRC_PORT CONFIGURE_DEPENDS "port/*.cpp" "port/*.c" "port/*.h")
 list(FILTER SSB64_SRC_PORT EXCLUDE REGEX "port/stubs/")
 # RelocFileTable.{us,jp}.cpp both define gRelocFileTable — compile only the
 # selected version's table (the rest are siblings for the other version).
@@ -500,17 +571,27 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Android")
         "port/enhancements/(Updater|DiscordRichPresence|ShaderDownloader)\\.cpp$")
     list(FILTER SSB64_SRC_PORT EXCLUDE REGEX "port/port_window_icon\\.cpp$")
 endif()
+if(BATTLESHIP_UWP)
+    # Xbox packages are updated as MSIX and cannot use these Win32
+    # shell-out/IPC integrations.
+    list(FILTER SSB64_SRC_PORT EXCLUDE REGEX
+        "port/enhancements/(Updater|DiscordRichPresence|ShaderDownloader)\\.cpp$")
+    list(FILTER SSB64_SRC_PORT EXCLUDE REGEX "port/port_window_icon\\.cpp$")
+    list(FILTER SSB64_SRC_PORT EXCLUDE REGEX "port/first_run\\.cpp$")
+endif()
 # Treat the generated icon header as a source so CMake schedules it ahead
 # of any port TU compilation (port_window_icon.cpp #includes it).
-if (NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
+if (NOT CMAKE_SYSTEM_NAME STREQUAL "Android" AND NOT BATTLESHIP_UWP)
     list(APPEND SSB64_SRC_PORT ${SSB64_ICON_GEN})
 endif()
-# Arrow baked headers — added as sources so CMake schedules their generation
-# before any port TU compilation.  Stage background/icon PNGs are disk-loaded
-# at runtime; no baked headers for those.
+# Arrow + nameplate baked headers — added as sources so CMake schedules their
+# generation before any port TU compilation.  Stage background/icon PNGs are
+# ROM-derived and therefore disk-loaded/o2r-derived at runtime; no baked
+# headers for those.
 list(APPEND SSB64_SRC_PORT
     ${SSB64_CSS_ARROW_H}
     ${SSB64_CSS_ARROW_LEFT_H}
+    ${SSB64_CSS_NAMEPLATE_HEADERS}
 )
 
 # Debug tools (GBI trace + Acmd trace systems)
@@ -675,10 +756,28 @@ set(SSB64_LIBULTRA_PORT
     decomp/src/libultra/gu/mtxutil.c        # guMtxF2L, guMtxL2F, guMtxIdentF
     decomp/src/libultra/gu/mtxxfmf.c        # guMtxXFMF
     decomp/src/libultra/gu/normalize.c      # guNormalize
+    decomp/src/libultra/gu/sinf.c           # __sinf — SGI polynomial + Cody-Waite reduction
+    decomp/src/libultra/gu/cosf.c           # __cosf — same (all game trig routes here, not host libm)
     # NOTE: sprite.c is NOT included — drawbitmap is assembly-only (MIPS).
     # Sprite functions are stubbed in port/stubs/n64_stubs.c instead.
 )
 target_sources(ssb64_game PRIVATE ${SSB64_LIBULTRA_PORT})
+
+# The SGI trig sources type-pun floats through int* (guint.h du/fu idiom) and
+# their double-precision polynomials must evaluate identically on every host:
+# AArch64 contracts a*b+c into fmadd by default, which perturbs the last ulp
+# vs. the N64's separate mul/add. Their #pragma weak sinf/cosf aliases also
+# capture the handful of bare sinf()/cosf() decomp call sites, matching how
+# libultra linked on hardware (MSVC ignores the pragma; those sites keep host
+# libm there). -fno-builtin keeps GCC/Clang from constant-folding or
+# sincos-fusing bare calls past the aliases.
+if (NOT MSVC)
+    set_source_files_properties(
+        decomp/src/libultra/gu/sinf.c
+        decomp/src/libultra/gu/cosf.c
+        PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-fno-strict-aliasing")
+    target_compile_options(ssb64_game PRIVATE -fno-builtin-sinf -fno-builtin-cosf)
+endif()
 
 # N64 audio library — synthesis driver, sequence player, voice management.
 # These decomp files are compiled with PORT defines; the CPU Acmd interpreter
@@ -766,7 +865,7 @@ endif()
 # Fetch Discord RPC (desktop only — Android drops Discord Rich Presence
 # along with the rest of the network-dependent features).
 ################################################################################
-if (NOT CMAKE_SYSTEM_NAME MATCHES "Android|NintendoSwitch")
+if (NOT CMAKE_SYSTEM_NAME MATCHES "Android|NintendoSwitch" AND NOT BATTLESHIP_UWP)
     # discord-rpc v3.4.0's CMakeLists declares cmake_minimum_required(VERSION 2.x),
     # which CMake 3.30+ refuses to honor. Force a baseline policy version for the
     # fetched subdir so the build still configures with current CMake.
@@ -806,12 +905,15 @@ endif()
 if (CMAKE_SYSTEM_NAME STREQUAL "Android")
     # SDLActivity (Java) loads a shared library and calls SDL_main from it
     # via dlsym. Output name `main` matches SDL2's default `libmain.so`
-    # lookup. The aarch64 coroutine asm shim is pulled in here so the
-    # SHARED target builds with the .S preprocessed by clang.
+    # lookup. Both ARM coroutine asm shims are pulled in here so the SHARED
+    # target builds with the .S preprocessed by clang; each file's body is
+    # #if-guarded on the target arch (__aarch64__ / __arm__), so only the
+    # one matching ANDROID_ABI emits code.
     add_library(${PROJECT_NAME} SHARED
         ${SSB64_SRC_PORT}
         ${SSB64_DEBUG_TOOLS}
         port/coroutine_aarch64.S
+        port/coroutine_armv7.S
     )
     set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "main")
 elseif (CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
@@ -821,6 +923,19 @@ elseif (CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
         port/coroutine_aarch64.S
     )
     set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "${SSB64_APP_NAME}")
+elseif(BATTLESHIP_UWP)
+    # The UWP CoreApplication executable is a tiny wrapper in uwp/. Keep the
+    # existing game entrypoint in a DLL and export SDL_main for that wrapper.
+    # ssb64_game is linked below via target_link_libraries (it is a STATIC
+    # library in this fork, not an OBJECT library).
+    add_library(${PROJECT_NAME} SHARED
+        ${SSB64_SRC_PORT}
+        ${SSB64_DEBUG_TOOLS}
+    )
+    set_target_properties(${PROJECT_NAME} PROPERTIES
+        OUTPUT_NAME "BattleShip"
+        WINDOWS_EXPORT_ALL_SYMBOLS TRUE
+    )
 else()
     add_executable(${PROJECT_NAME} ${SSB64_SRC_PORT} ${SSB64_DEBUG_TOOLS})
 
@@ -861,7 +976,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/debug_tools
     ${SSB64_CSS_GEN_DIR}                         # CSS icon baked headers (arrow_data.h)
 )
-if (NOT CMAKE_SYSTEM_NAME MATCHES "Android|NintendoSwitch")
+if (NOT CMAKE_SYSTEM_NAME MATCHES "Android|NintendoSwitch" AND NOT BATTLESHIP_UWP)
     target_include_directories(${PROJECT_NAME} PRIVATE
         ${SSB64_ICON_GEN_DIR}                         # Generated icon header (port_icon_data.h)
         ${discord_rpc_SOURCE_DIR}/include             # Discord Rich Presence
@@ -881,9 +996,19 @@ endif()
 if (CMAKE_SYSTEM_NAME MATCHES "Android|NintendoSwitch")
     add_dependencies(${PROJECT_NAME} libultraship)
     target_link_libraries(${PROJECT_NAME} PRIVATE libultraship)
+elseif(BATTLESHIP_UWP)
+    add_dependencies(${PROJECT_NAME} libultraship TorchExternal)
+    target_link_libraries(${PROJECT_NAME} PRIVATE libultraship SDL2 LIBUWP GLFW3)
 else()
     add_dependencies(${PROJECT_NAME} libultraship TorchExternal discord-rpc)
     target_link_libraries(${PROJECT_NAME} PRIVATE libultraship discord-rpc)
+endif()
+
+# macOS: the port calls CFPreferences* directly (ApplePressAndHoldEnabled fix
+# in main()), so link CoreFoundation explicitly rather than relying on it
+# arriving transitively through libultraship's PRIVATE framework links.
+if (APPLE)
+    target_link_libraries(${PROJECT_NAME} PRIVATE "-framework CoreFoundation")
 endif()
 add_dependencies(ssb64_game GenerateCreditsAssets)
 if (NOT DISABLE_SCRIPTING)
@@ -931,7 +1056,7 @@ endif()
 # Platform-specific settings
 ################################################################################
 
-if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
+if (CMAKE_SYSTEM_NAME STREQUAL "Windows" AND NOT BATTLESHIP_UWP)
     target_link_options(${PROJECT_NAME} PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)
     target_link_libraries(${PROJECT_NAME} PRIVATE shell32)
     # DMA functions (osEPiStartDma, osPiStartDma) are provided by LUS.
@@ -963,9 +1088,9 @@ endif()
 ################################################################################
 # TCC mod scripting: export the engine's full symbol table so libtcc-compiled
 # mods can resolve any engine function by name. On Windows this is what makes
-# `tcc.exe -impdef BattleShip.exe -o BattleShip.def` produce a useful import
-# library; on Unix the linker default-visibility + -Wl,-export-dynamic above
-# handles it.
+# `tcc.exe -impdef BattleShip.exe -o BattleShip.def` produce a useful export
+# list for ScriptLoader's memory-mode symbol registration; on Unix the linker
+# default-visibility + -Wl,-export-dynamic above handles it.
 ################################################################################
 if(NOT DISABLE_SCRIPTING)
     # ENABLE_EXPORTS makes the EXE produce an import library (.lib) and
@@ -1060,14 +1185,15 @@ endif()
 # self-contained; modders don't have to install TinyCC.
 #
 # On Windows we additionally run `tcc.exe -impdef BattleShip.exe -o
-# BattleShip.def` to generate the import library that libtcc links mod
-# objects against. WINDOWS_EXPORT_ALL_SYMBOLS (set above) makes the EXE's
-# export table contain every engine function so the .def covers them all.
+# BattleShip.def` to generate the export-name list that ScriptLoader resolves
+# against the running process before TCC relocates mod code. WINDOWS_EXPORT_ALL_SYMBOLS
+# (set above) makes the EXE's export table contain every engine function so
+# the .def covers them all.
 ################################################################################
 if(NOT DISABLE_SCRIPTING)
     if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
         add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-            COMMENT "Copying libtcc headers, libs, and runtime DLL..."
+            COMMENT "Copying libtcc headers and runtime libraries..."
             COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${PROJECT_NAME}>/.tcc/"
             COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${PROJECT_NAME}>/.tcc/lib/"
             COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${PROJECT_NAME}>/.tcc/include/"
@@ -1078,34 +1204,18 @@ if(NOT DISABLE_SCRIPTING)
                 "${CMAKE_BINARY_DIR}/_deps/tinycc-src/win32/include/"
                 "$<TARGET_FILE_DIR:${PROJECT_NAME}>/.tcc/include/"
             # libtcc1.a built by MSVC is COFF format which TCC can't
-            # parse. Use tcc.exe itself to recompile the runtime sources
+            # parse. Use tcc.exe itself to recompile the runtime source
             # into a TCC-readable archive. -B points tcc at .tcc/ for
-            # tccdefs.h (auto-included via the command line). This
-            # produces libtcc1.o + dllcrt1.o + dllmain.o in TCC's native
-            # object format, then `tcc -ar rcs` bundles them.
+            # tccdefs.h (auto-included via the command line).
             COMMAND "$<TARGET_FILE:tcc>"
                 -B "$<TARGET_FILE_DIR:${PROJECT_NAME}>/.tcc"
                 -c "${CMAKE_BINARY_DIR}/_deps/tinycc-src/lib/libtcc1.c"
                 -o "$<TARGET_FILE_DIR:${PROJECT_NAME}>/.tcc/lib/libtcc1.o"
-            COMMAND "$<TARGET_FILE:tcc>"
-                -B "$<TARGET_FILE_DIR:${PROJECT_NAME}>/.tcc"
-                -c "${CMAKE_BINARY_DIR}/_deps/tinycc-src/win32/lib/dllcrt1.c"
-                -o "$<TARGET_FILE_DIR:${PROJECT_NAME}>/.tcc/lib/dllcrt1.o"
-            COMMAND "$<TARGET_FILE:tcc>"
-                -B "$<TARGET_FILE_DIR:${PROJECT_NAME}>/.tcc"
-                -c "${CMAKE_BINARY_DIR}/_deps/tinycc-src/win32/lib/dllmain.c"
-                -o "$<TARGET_FILE_DIR:${PROJECT_NAME}>/.tcc/lib/dllmain.o"
             COMMAND "$<TARGET_FILE:tcc>" -ar rcs
                 "$<TARGET_FILE_DIR:${PROJECT_NAME}>/.tcc/lib/libtcc1.a"
                 "$<TARGET_FILE_DIR:${PROJECT_NAME}>/.tcc/lib/libtcc1.o"
-                "$<TARGET_FILE_DIR:${PROJECT_NAME}>/.tcc/lib/dllcrt1.o"
-                "$<TARGET_FILE_DIR:${PROJECT_NAME}>/.tcc/lib/dllmain.o"
-            # libtcc is built SHARED -> tcc.dll. The exe imports its symbols,
-            # so it must be loadable at process start. Without this the exe
-            # fails with 0xC0000135 (DLL not found) before main() runs.
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "$<TARGET_FILE:libtcc>"
-                "$<TARGET_FILE_DIR:${PROJECT_NAME}>/$<TARGET_FILE_NAME:libtcc>"
+            COMMAND ${CMAKE_COMMAND} -E rm -f
+                "$<TARGET_FILE_DIR:${PROJECT_NAME}>/.tcc/lib/libtcc1.o"
             VERBATIM
         )
         add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
@@ -1203,10 +1313,10 @@ endif()
 # per-build-dir sink (${CMAKE_BINARY_DIR}/extracted) instead, then stage it
 # next to the binary. Torch writes config.yml's `output.binary`
 # (BattleShip.o2r, identical for both regions) into its `-d` dir,
-# independent of `-s` (where it reads config/yamls). The runtime archive
-# name stays the fixed "BattleShip.o2r"; only the dev-build location is
-# isolated. Packaged-release first-run extraction (sidecar torch +
-# config.yml, its own -d) is unaffected.
+# independent of `-s` (where it reads config/yamls). The staged runtime
+# name follows SSB64_APP_NAME (BattleShip.o2r or BattleShip-JP.o2r), while
+# the extracted build artifact stays fixed. Packaged-release first-run
+# extraction (sidecar torch + config.yml, its own -d) is unaffected.
 set(SSB64_O2R_DIR ${CMAKE_BINARY_DIR}/extracted)
 set(SSB64_O2R     ${SSB64_O2R_DIR}/BattleShip.o2r)
 
@@ -1250,8 +1360,8 @@ if(EXISTS "${SSB64_BASEROM}")
     add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${SSB64_O2R}
-            $<TARGET_FILE_DIR:${PROJECT_NAME}>/BattleShip.o2r
-        COMMENT "Staging BattleShip.o2r next to ssb64 binary"
+            $<TARGET_FILE_DIR:${PROJECT_NAME}>/${SSB64_APP_NAME}.o2r
+        COMMENT "Staging ${SSB64_APP_NAME}.o2r next to ssb64 binary"
     )
 else()
     add_custom_target(ExtractAssets
@@ -1276,7 +1386,10 @@ add_custom_target(GenerateBattleShipO2R
 #
 # Desktop-only.  Android is a follow-up task (stage PNGs need to be packaged
 # into the APK assets/ and extracted to externalFilesDir on first launch).
-if(EXISTS "${SSB64_BASEROM}")
+# derive_stage_assets.py currently understands the US ROM layout only.
+# This affects three additional CSS stage images, not the main game assets.
+set(SSB64_CSS_ASSET_ROM "${CMAKE_CURRENT_SOURCE_DIR}/baserom.us.z64")
+if(EXISTS "${SSB64_CSS_ASSET_ROM}")
     add_custom_command(
         OUTPUT
             ${SSB64_CSS_FD_BG_PNG}
@@ -1291,12 +1404,12 @@ if(EXISTS "${SSB64_BASEROM}")
             ${SSB64_CSS_BF_NAME_PNG}
         COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/derive_stage_assets.py
-                ${SSB64_BASEROM}
+                ${SSB64_CSS_ASSET_ROM}
                 ${SSB64_CSS_STAGE_ASSET_DIR}
         DEPENDS
-            ${SSB64_BASEROM}
+            ${SSB64_CSS_ASSET_ROM}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/derive_stage_assets.py
-        COMMENT "Extracting CSS stage assets from ${SSB64_BASEROM}"
+        COMMENT "Extracting CSS stage assets from ${SSB64_CSS_ASSET_ROM}"
         VERBATIM
     )
     add_custom_target(DeriveStageAssets
@@ -1384,17 +1497,19 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Android")
     target_link_libraries(torch_runner PRIVATE torch)
     set_target_properties(torch_runner PROPERTIES OUTPUT_NAME "torch_runner")
 
-    # Standalone aarch64 coroutine test (off by default — opt in for asm
+    # Standalone ARM coroutine test (off by default — opt in for asm
     # regression validation, see docs/android_port_status_*.md). Pushes a
     # tiny binary to /data/local/tmp/ to verify the asm context-switch
-    # without needing the full game.
+    # without needing the full game. Both .S shims are arch-#if-guarded, so
+    # the same target builds for arm64-v8a and armeabi-v7a.
     option(SSB64_BUILD_COROUTINE_TEST
-        "Build the aarch64 coroutine standalone test binary (Android)" OFF)
+        "Build the ARM coroutine standalone test binary (Android)" OFF)
     if (SSB64_BUILD_COROUTINE_TEST)
         add_executable(coroutine_test
             port/coroutine_test.cpp
             port/coroutine_android.cpp
             port/coroutine_aarch64.S
+            port/coroutine_armv7.S
         )
         target_include_directories(coroutine_test PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/port

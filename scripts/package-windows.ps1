@@ -13,6 +13,11 @@
 #     SDL2.dll                   — runtime dependency (vcpkg-bundled)
 #     <other vcpkg DLLs>         — picked up by Get-ChildItem from build dir
 #
+# The default US Windows package includes TCC scripting support. It statically
+# links libtcc into BattleShip.exe and stages only TinyCC headers plus libtcc1.a
+# under .tcc, avoiding the tcc.dll false-positive signature while ScriptLoader
+# relocates mod code in memory.
+#
 # Portable: drop the extracted folder anywhere and run BattleShip.exe.
 # Save data and config (ssb64_save.bin, BattleShip.cfg.json, logs/) land
 # next to the .exe in the extraction directory — move the folder, the
@@ -41,11 +46,24 @@ $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 # unaffected.
 $Ver = if ($env:SSB64_VERSION) { $env:SSB64_VERSION } else { "us" }
 if ($Ver -ne "us" -and $Ver -ne "jp") { Write-Error "SSB64_VERSION must be us|jp"; exit 1 }
-$BuildDir = Join-Path $Root "build-bundle-win-$Ver"
+if ($env:SSB64_ENABLE_SCRIPTING) {
+    $EnableScripting = $env:SSB64_ENABLE_SCRIPTING -in @("1", "ON", "TRUE", "YES", "on", "true", "yes")
+} else {
+    $EnableScripting = $Ver -eq "us"
+}
+if ($EnableScripting -and $Ver -eq "jp") {
+    Write-Error "JP source modding is not release-supported yet; the TCC mod API still compiles mods with US region defines."
+    exit 1
+}
+$DisableScripting = if ($EnableScripting) { "OFF" } else { "ON" }
+$PackageFlavor = if ($EnableScripting) { "scripting" } else { "standard" }
+$ZipSuffix = "-windows"
+$BuildDir = Join-Path $Root "build-bundle-win-$Ver-$PackageFlavor"
 $DistDir = Join-Path $Root "dist"
 $AppName = if ($Ver -eq "jp") { "BattleShip-JP" } else { "BattleShip" }
-$StageDir = Join-Path $DistDir $AppName
-$ZipPath = Join-Path $DistDir "$AppName-windows.zip"
+$StageName = $AppName
+$StageDir = Join-Path $DistDir $StageName
+$ZipPath = Join-Path $DistDir "$AppName$ZipSuffix.zip"
 $Jobs = if ($env:NUMBER_OF_PROCESSORS) { [int]$env:NUMBER_OF_PROCESSORS } else { 4 }
 
 function Write-Step($msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
@@ -69,7 +87,7 @@ foreach ($f in @("info.credits.us.txt", "companies.credits.us.txt")) {
 Pop-Location
 
 # ── 1. Configure + build (Release, portable) ──
-Write-Step "Configuring release build (portable)"
+Write-Step "Configuring release build (portable, scripting=$EnableScripting)"
 # No NON_PORTABLE, no CMAKE_INSTALL_PREFIX. LUS resolves the bundle path
 # via GetModuleFileNameW at runtime, and the port's port_save.cpp +
 # Ship::Context::GetAppDirectoryPath() route saves/config to the cwd
@@ -86,6 +104,7 @@ $PythonExe = (Get-Command python).Source
 Write-Host "Using Python: $PythonExe"
 cmake -B $BuildDir $Root `
     -DCMAKE_BUILD_TYPE=Release `
+    "-DDISABLE_SCRIPTING=$DisableScripting" `
     "-DSSB64_VERSION=$Ver" `
     "-DPython3_EXECUTABLE=$PythonExe" `
     | Out-Null
@@ -201,6 +220,19 @@ Get-ChildItem -Path $ExeBuildDir -Filter "*.dll" | ForEach-Object {
     Copy-Item $_.FullName $StageDir
 }
 
+if ($EnableScripting) {
+    Write-Step "Staging TCC scripting runtime"
+    $TccDir = Join-Path $ExeBuildDir ".tcc"
+    if (-not (Test-Path $TccDir)) { Fail ".tcc scripting runtime not found at $TccDir" }
+    Copy-Item $TccDir (Join-Path $StageDir ".tcc") -Recurse -Force
+    $TccPeFiles = Get-ChildItem -Path (Join-Path $StageDir ".tcc") -Recurse -File |
+        Where-Object { $_.Extension -in @(".dll", ".exe") }
+    if ($TccPeFiles) {
+        $Names = ($TccPeFiles | ForEach-Object { $_.FullName }) -join "`n"
+        Fail ".tcc scripting runtime contains PE executables:`n$Names"
+    }
+}
+
 # ── 5. Zip ──
 Write-Step "Compressing $ZipPath"
 if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
@@ -210,4 +242,9 @@ if (-not (Test-Path $ZipPath)) { Fail "zip was not created" }
 $ZipKB = [int]((Get-Item $ZipPath).Length / 1024)
 Write-Host "`n✓ Release zip ready: $ZipPath ($ZipKB KB)" -ForegroundColor Green
 Write-Host "   Portable: extract anywhere; save data lives next to BattleShip.exe."
+if ($EnableScripting) {
+    Write-Host "   Includes TCC scripting support for C mods."
+} else {
+    Write-Host "   TCC scripting disabled for this local/package variant."
+}
 Write-Host "   First launch will prompt for your ROM via the ImGui wizard."

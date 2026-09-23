@@ -2,7 +2,7 @@
 // the .so via dlsym("SDL_main"), so we let SDL_main.h's `#define main SDL_main`
 // rename the entry point during preprocessing — which is exactly what
 // SDL_MAIN_HANDLED would suppress.
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !defined(BATTLESHIP_UWP)
 #define SDL_MAIN_HANDLED
 #endif
 #include "port.h"
@@ -13,6 +13,7 @@
 #include <libultraship/controller/controldeck/ControlDeck.h>
 #include <fast/Fast3dWindow.h>
 #include <ship/resource/File.h>
+#include <chrono>
 #include <string>
 #include <vector>
 #include <cstdio>
@@ -41,6 +42,9 @@
 #if !defined(__ANDROID__)
 #include "port_window_icon.h"
 #endif
+#if defined(__ANDROID__)
+#include <android/api-level.h>  // android_get_device_api_level (audio-driver gate)
+#endif
 #ifndef DISABLE_SCRIPTING
 #include "mods/HookManager.h"
 #include "mods/SymbolResolver.h"
@@ -48,6 +52,8 @@
 #include "renderdoc_trigger.h"
 #include "port_log.h"
 #include "fighter_registry.h"
+#include "focus.h"
+#include "shaders/fast3d_shader_manifest.h"
 
 #ifndef DISABLE_SCRIPTING
 #include <ship/scripting/ScriptLoader.h>
@@ -112,7 +118,12 @@ extern "C" void* sModBridgeAnchorDataFilesRef = (void*)&dFTManagerDataFiles_Ref;
 #include <filesystem>
 #include <system_error>
 
-#ifdef _WIN32
+#include <ship/debug/Console.h>
+#ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>
+#endif
+
+#if defined(_WIN32) && !defined(BATTLESHIP_UWP)
 #include <windows.h>
 #include <dbghelp.h>
 #include <psapi.h>
@@ -449,7 +460,15 @@ void MountModsDir() {
 	auto am = rm->GetArchiveManager();
 	if (!am) return;
 
+#ifdef BATTLESHIP_UWP
+	const fs::path usbMods(ssb64::ExternalDataPath("mods"));
+	std::error_code rootEc;
+	const fs::path modsDir = fs::is_directory(usbMods, rootEc)
+	                           ? usbMods
+	                           : fs::path(Ship::Context::GetAppDirectoryPath()) / "mods";
+#else
 	const fs::path modsDir(ssb64::RealAppBundlePath() + "/mods");
+#endif
 	std::error_code ec;
 	if (!fs::exists(modsDir, ec)) {
 		return;
@@ -505,6 +524,40 @@ void MountModsDir() {
 	walk(modsDir);
 }
 
+/* Unmount mod archives whose on-disk source no longer exists. MountModsDir
+ * only ever ADDS archives, so a mod folder/.o2r deleted at runtime stays
+ * mounted in the ArchiveManager for the rest of the session — Hot Reload would
+ * recompile it from the still-mounted VFS and Rescan would still list it.
+ * Removing the stale archive here lets both reflect deletions. Only archives
+ * carrying a manifest.json are considered, so the base game + shader archives
+ * are never touched. Call with mod scripts already unloaded (the loaded image
+ * is independent of the archive, but unloading first keeps state consistent). */
+void UnmountMissingMods() {
+	namespace fs = std::filesystem;
+	auto rm = sContext ? sContext->GetResourceManager() : nullptr;
+	if (!rm) return;
+	auto am = rm->GetArchiveManager();
+	if (!am) return;
+	auto archives = am->GetArchives();
+	if (!archives) return;
+
+	/* Collect first, then remove — don't mutate the manager's list mid-walk. */
+	std::vector<std::string> stale;
+	for (const auto& a : *archives) {
+		if (!a) continue;
+		if (!a->HasFile("manifest.json")) continue; /* not a mod */
+		const std::string path = a->GetPath();
+		std::error_code ec;
+		if (!fs::exists(fs::path(path), ec)) {
+			stale.push_back(path);
+		}
+	}
+	for (const auto& path : stale) {
+		am->RemoveArchive(path);
+		port_log("SSB64: unmounted deleted mod archive -> %s\n", path.c_str());
+	}
+}
+
 } // namespace ssb64
 #endif
 
@@ -530,22 +583,37 @@ void MountModsDir() {
 //      is wrong for any user that doesn't unzip into a "BattleShip"
 //      subdir matching their cwd.
 static std::string PortLocateFile(const std::string& basename) {
-	namespace fs = std::filesystem;
-	std::error_code ec;
+	// Shared probe order lives in ssb64::LocateExistingFile (app_paths.cpp)
+	// so every optional-file lookup walks the same directories; this wrapper
+	// keeps the historical "./<name>" miss value so callers that open the
+	// path get a readable error message.
+	std::string found = ssb64::LocateExistingFile(basename);
+	return found.empty() ? "./" + basename : found;
+}
 
-	const fs::path appDir(Ship::Context::GetAppDirectoryPath());
-	fs::path p1 = appDir / basename;
-	if (fs::exists(p1, ec)) {
-		return p1.lexically_normal().string();
+/* ── Console "reset" command ─────────────────────────────────────────────
+ * The ESC-menu Reset button (port/gui/Menu.cpp) and the Ctrl/Cmd-R shortcut
+ * (libultraship Gui.cpp) both Dispatch("reset") at the LUS console, but the
+ * command was never registered, so both fell through to "[LUS] Command not
+ * found" and did nothing.
+ *
+ * The handler performs an in-game reset back to the boot scene — the same
+ * "return to title" semantics as a console reset — via the scene manager's
+ * normal transition path. The mechanics live decomp-side in
+ * portSCManagerRequestReset() (decomp/src/sc/scmanager.c) because the port
+ * layer can't include decomp headers (the C shim stdlib shadows libc++ —
+ * see the include-path note in CMakeLists.txt) and mirroring the scene
+ * struct layout here would invite exactly the layout-drift bugs
+ * docs/debug_ido_bitfield_layout.md warns about. */
+extern "C" void portSCManagerRequestReset(void);
+
+static int32_t ResetCommandHandler(std::shared_ptr<Ship::Console> console, std::vector<std::string> args,
+                                   std::string* output) {
+	portSCManagerRequestReset();
+	if (output) {
+		*output = "Resetting to the opening scene...";
 	}
-
-	const fs::path bundleDir(ssb64::RealAppBundlePath());
-	fs::path p2 = bundleDir / basename;
-	if (fs::exists(p2, ec)) {
-		return p2.lexically_normal().string();
-	}
-
-	return "./" + basename;
+	return 0;
 }
 
 extern "C" {
@@ -622,6 +690,16 @@ static int PortInitImpl(int argc, char* argv[]) {
 #endif
 	port_log("SSB64: Config + CVars OK\n");
 
+#ifdef BATTLESHIP_UWP
+	// Xbox is controller-first. Set this before the first ImGui frame so
+	// View/Back can open the menu and A/B + D-pad/stick can operate it.
+	sContext->GetConsoleVariables()->SetInteger("gControlNav", 1);
+	// Use the CoreWindow swap-chain path validated by the Xbox UWP wrapper.
+	sContext->GetConfig()->SetInt("Window.Backend.Id",
+	                            static_cast<int>(Ship::WindowBackend::FAST3D_DXGI_DX11));
+	sContext->GetConfig()->SetString("Window.Backend.Name", "DirectX 11");
+#endif
+
 	/* Latch the Classic Co-op menu choice for this launch — the toggle
 	 * swaps which CSS overlay Classic mode enters, so it only applies on
 	 * the next boot ("(Needs reload)" on the menu widget). */
@@ -634,6 +712,11 @@ static int PortInitImpl(int argc, char* argv[]) {
 	// Assets → Mods menu, takes effect next cache miss. US-only (see
 	// CMakeLists.txt — JP builds drop port/hires/ entirely).
 	ssb64::hires::HiResPack::Get().Init();
+	// Warm the decoded-texture cache on background threads (issue #215) so
+	// first use of a pack texture doesn't stall the game/render thread on a
+	// synchronous PNG decode. Gated by gHiResTextures.Preload (default on
+	// for desktop, off on Android).
+	ssb64::hires::HiResPack::Get().StartPreload();
 	ssb64_hires_register();
 #endif
 
@@ -784,6 +867,10 @@ static int PortInitImpl(int argc, char* argv[]) {
 	if (!sContext->InitConsole()) { port_log("SSB64: InitConsole failed\n"); return 1; }
 	port_log("SSB64: CrashHandler + Console OK\n");
 
+	/* Back the ESC-menu Reset button / Ctrl+Cmd-R Dispatch("reset") with a
+	 * real command — see the reset block above PortInit for the mechanism. */
+	sContext->GetConsole()->AddCommand("reset", { ResetCommandHandler, "Resets the game to the opening scene" });
+
 	// ControlDeck MUST be initialized before Window — the DXGI window proc
 	// calls ControllerUnblockGameInput on WM_SETFOCUS during window creation.
 	//
@@ -834,7 +921,7 @@ static int PortInitImpl(int argc, char* argv[]) {
 			port_log("SSB64: Port menu attached\n");
 		}
 
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !defined(BATTLESHIP_UWP)
 		// Linux: WMs only show the app icon if SDL_SetWindowIcon is called
 		// on the live window. .ico/.icns paths are baked into the .exe /
 		// .app on Windows / macOS so this is a no-op there. Android pulls
@@ -867,6 +954,18 @@ static int PortInitImpl(int argc, char* argv[]) {
 	 *      render loop until the user provides a ROM and extraction
 	 *      succeeds — or quits the window. */
 	{
+#ifdef BATTLESHIP_UWP
+		// A UWP app cannot launch the desktop Torch sidecar or browse arbitrary
+		// files. Assets are prepared on a PC and copied to E:/BattleShip.
+		std::error_code ec;
+		const std::string archive = PortLocateFile(SSB64_O2R_NAME);
+		if (!std::filesystem::exists(archive, ec)) {
+			port_log("SSB64: missing E:/BattleShip/%s; run the packaged US asset tool and copy its output to USB\n",
+			         SSB64_O2R_NAME);
+			PortShutdown();
+			return 1;
+		}
+#else
 		const std::string targetO2r =
 			Ship::Context::GetPathRelativeToAppDirectory(SSB64_O2R_NAME);
 		// silent=true: any failure during this auto-attempt should land in
@@ -890,6 +989,7 @@ static int PortInitImpl(int argc, char* argv[]) {
 				return 1;
 			}
 		}
+#endif
 	}
 
 	{
@@ -932,6 +1032,19 @@ static int PortInitImpl(int argc, char* argv[]) {
 	}
 
 	{
+		auto window = std::dynamic_pointer_cast<Fast::Fast3dWindow>(sContext->GetWindow());
+		if (window != nullptr) {
+			const auto start = std::chrono::steady_clock::now();
+			const auto progress = window->PrewarmShaders(ssb64::GetFast3dShaderManifest());
+			const double elapsedMs = std::chrono::duration<double, std::milli>(
+				std::chrono::steady_clock::now() - start).count();
+			port_log("SSB64: Fast3D warmup complete=%d compiled=%zu cached=%zu failed=%zu skipped=%zu ms=%.2f\n",
+			         progress.complete ? 1 : 0, progress.compiled, progress.alreadyCached,
+			         progress.failed, progress.skipped, elapsedMs);
+		}
+	}
+
+	{
 		/* SSB64's audio synthesis path produces interleaved s16 stereo PCM at
 		 * 32 kHz (sSYAudioFrequency, see src/sys/audio.c).  LUS's default
 		 * AudioSettings::SampleRate is 44100 Hz — passing an empty {} settings
@@ -952,14 +1065,15 @@ static int PortInitImpl(int argc, char* argv[]) {
 	// Must happen AFTER InitEventSystem (PortRegisterEvents calls
 	// EventSystemRegisterEvent, which dereferences Context::GetEventSystem()).
 	PortRegisterEvents();
+	ssb64::RegisterFocusListener();
 	port_log("SSB64: Engine events registered\n");
 
 #ifndef DISABLE_SCRIPTING
 	// TCC mod scripting: configure the include paths + library paths under
 	// .tcc/ that the engine populates post-build (see CMakeLists.txt). On
-	// Windows we link mods against BattleShip.def (auto-generated from the
-	// EXE export table); on Unix mods resolve symbols dynamically via the
-	// host process's exported symbols.
+	// Windows BattleShip.def is an export-name list that ScriptLoader resolves
+	// against the running EXE before TCC relocates mods into memory; on Unix
+	// mods resolve symbols dynamically via the host process's exported symbols.
 	{
 		std::unordered_map<std::string, std::string> defines = {
 			{ "PORT", "1" },
@@ -983,9 +1097,9 @@ static int PortInitImpl(int argc, char* argv[]) {
 			Ship::Context::GetPathRelativeToAppDirectory(".tcc/lib"),
 		};
 #ifdef _WIN32
-		std::vector<std::string> libraries = { "BattleShip.def" };
+		std::vector<std::string> libraries = { "BattleShip.def", "tcc1" };
 #else
-		std::vector<std::string> libraries = {};
+		std::vector<std::string> libraries = { "tcc1" };
 #endif
 		constexpr int kCodeVersion = 1;
 		/* -mms-bitfields makes TCC pack bitfields the way MSVC does
@@ -997,7 +1111,7 @@ static int PortInitImpl(int argc, char* argv[]) {
 		 * while MSVC splits them across multiple units, shifting every
 		 * field afterwards (e.g. `attr`, `joints`) and causing mod
 		 * reads to land on adjacent function-pointer fields. */
-		if (!sContext->InitScriptLoader(defines, kCodeVersion, "-g -mms-bitfields",
+		if (!sContext->InitScriptLoader(defines, kCodeVersion, "-mms-bitfields",
 		                                includePaths, libraryPaths, libraries)) {
 			port_log("SSB64: InitScriptLoader failed\n");
 			return 1;
@@ -1057,10 +1171,10 @@ static int PortInitImpl(int argc, char* argv[]) {
 
 	// TCC scripting: compile + load any .o2r / folder mod under mods/ that
 	// declares a `main` entry in its manifest.json. Each mod's source files
-	// are amalgamated by the ScriptLoader, compiled to a temp DLL via libtcc,
-	// and ModInit is called by name. The pre/post-init callbacks tag every
-	// HookManager::InstallHook call with the current mod name so hot-reload
-	// can selectively uninstall hooks per mod without touching others.
+	// are amalgamated by the ScriptLoader, compiled and relocated into memory
+	// via libtcc, and ModInit is called by name. The pre/post-init callbacks
+	// tag every HookManager::InstallHook call with the current mod name so
+	// hot-reload can selectively uninstall hooks per mod without touching others.
 	if (auto scripting = sContext->GetScriptLoader()) {
 		try {
 			scripting->CompileAll();
@@ -1089,6 +1203,20 @@ void PortShutdown(void) {
 	// that's about to be torn down).
 	ssb64::mods::HookManager::Shutdown();
 	ssb64::mods::SymbolResolver::Shutdown();
+
+	// Unload mod scripts now, while the Context's EventSystem is still fully
+	// alive, so each mod's ModExit (which calls UNREGISTER_LISTENER) can reach
+	// it. Otherwise the only UnloadAll happens inside ~Context via the
+	// sContext.reset() below — by which point the EventSystem is being torn
+	// down, so EventSystemUnregisterListener -> Context::GetEventSystem
+	// dereferences a dead shared_ptr<EventSystem> and crashes on exit whenever
+	// a listener-registering mod (e.g. one that REGISTER_LISTENERs in ModInit)
+	// is loaded. The later ~Context UnloadAll then finds nothing loaded.
+	if (sContext) {
+		if (auto scripting = sContext->GetScriptLoader()) {
+			scripting->UnloadAll();
+		}
+	}
 #endif
 
 	// Drop audio bridge resource references before Ship::Context goes away.
@@ -1112,6 +1240,7 @@ void PortShutdown(void) {
 			// AllRumble → sContext.reset() — same singleton-reentry caveat
 			// applies as the rumble cleanup below.
 			cd->ShutdownRaphnet();
+			cd->ShutdownGCAdapter();
 			cd->StopAllRumble();
 		}
 	}
@@ -1149,8 +1278,24 @@ int main(int argc, char* argv[]) {
 		}
 		port_log_init(logPath.c_str());
 	}
+	port_log("SSB64: main entered\n");
 
-#ifdef _WIN32
+#ifdef __APPLE__
+	/* Disable the macOS press-and-hold accent/diacritic popup for this app.
+	 * SDL keeps a Cocoa text-input context alive for the game window, so
+	 * holding a movement key (e.g. WASD) makes AppKit pop the accent picker
+	 * instead of delivering key-repeat — the held key stops registering as
+	 * down. AppKit reads ApplePressAndHoldEnabled from the app's user
+	 * defaults when the text-input context is first created, so this must
+	 * run before SDL creates the window (i.e. before PortInit). Writing it
+	 * per-app (kCFPreferencesCurrentApplication) leaves the global/system
+	 * default untouched. Key repeat still works. */
+	CFPreferencesSetAppValue(CFSTR("ApplePressAndHoldEnabled"), kCFBooleanFalse,
+	                         kCFPreferencesCurrentApplication);
+	CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+#endif
+
+#if defined(_WIN32) && !defined(BATTLESHIP_UWP)
 	SetUnhandledExceptionFilter(portWindowsCrashFilter);
 	AddVectoredExceptionHandler(1, portWindowsVectoredHandler);
 	std::atexit([]() {
@@ -1176,6 +1321,7 @@ int main(int argc, char* argv[]) {
 	// Initialize RenderDoc trigger BEFORE PortInit so the RenderDoc DLL
 	// can hook D3D11 before LUS creates the device.
 	portRenderDocInit();
+	port_log("SSB64: RenderDoc hook initialized\n");
 
 	if (PortInit(argc, argv) != 0) {
 		return 1;
@@ -1203,11 +1349,14 @@ int main(int argc, char* argv[]) {
 		         SDL_GetError());
 	}
 
-	// Prefer AAudio (Android 8.0+ low-latency audio API) over the default
-	// OpenSL ES backend. Worth a few ms of latency for a fighting game,
-	// and SDL2 falls back to OpenSL ES if AAudio isn't compiled in or
-	// the device rejects it.
-	SDL_SetHint(SDL_HINT_AUDIODRIVER, "aaudio");
+	// Prefer AAudio (low-latency) only where it exists — API 26+. AAudio's
+	// libaaudio.so is absent below that, and SDL_AudioInit does NOT fall back
+	// once a driver name is pinned (it fails with "Audio target not
+	// available"), so forcing it on older devices kills audio outright. Below
+	// 26 we leave the hint unset and let SDL auto-select OpenSL ES.
+	if (android_get_device_api_level() >= 26) {
+		SDL_SetHint(SDL_HINT_AUDIODRIVER, "aaudio");
+	}
 
 	// 2. Suppress ImGui's per-frame SDL_GetDisplayUsableBounds JNI path.
 	//    ImGui_ImplSDL2_UpdateMonitors runs on the SSB64 GFX coroutine

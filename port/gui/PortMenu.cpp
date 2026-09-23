@@ -9,6 +9,7 @@
 
 #include "Compat.h"
 #include "../enhancements/enhancements.h"
+#include "../interpolation/frame_interpolation.h"
 #ifdef PORT_HIRES_ENABLED
 #include "../hires/HiResPack.h"
 #endif
@@ -21,8 +22,9 @@
 #ifndef DISABLE_SCRIPTING
 #include <ship/scripting/ScriptLoader.h>
 #include "../mods/HookManager.h"
+#include "../mods/ModRegistry.h"
 
-namespace ssb64 { void MountModsDir(); }
+namespace ssb64 { void MountModsDir(); void UnmountMissingMods(); }
 #endif
 
 #include <imgui.h>
@@ -33,6 +35,7 @@ namespace ssb64 { void MountModsDir(); }
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 
@@ -64,6 +67,15 @@ static const std::map<int32_t, const char*> kTextureFilteringMap = {
     { Fast::FILTER_THREE_POINT, "Three-Point" },
     { Fast::FILTER_LINEAR, "Linear" },
     { Fast::FILTER_NONE, "None" },
+};
+
+// Enhanced framerate mode: CVar stores the target render fps; game logic
+// always stays at 60 Hz (see port/interpolation/frame_interpolation.h).
+static const std::map<int32_t, const char*> kEnhancedFpsMap = {
+    { 0, "Off (60 FPS)" },
+    { 120, "120 FPS" },
+    { 180, "180 FPS" },
+    { 240, "240 FPS" },
 };
 
 // Mirrors the LowResMode switch in libultraship Gui::CalculateGameViewport /
@@ -345,7 +357,7 @@ void RenderPostProcessDiagnostics(WidgetInfo& /*widget*/) {
     }
 }
 
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !defined(BATTLESHIP_UWP)
 // Shader-pack downloader UI is gated off on Android (the libretro
 // catalog fetch + ZIP-extract pipeline doesn't fit Play Store distro;
 // port/enhancements/ShaderDownloader.cpp is not compiled into libmain.so).
@@ -846,7 +858,7 @@ void PortMenu::AddMenuSettings() {
         .RaceDisable(false)
         .Options(CheckboxOptions().Tooltip("Gives the search input focus when it becomes visible."));
 
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !defined(BATTLESHIP_UWP)
     // DRP — Android drops discord-rpc entirely (no curl + Play Store
     // distribution friction; the Discord SDK isn't built for mobile).
     AddWidget(path, "Enable Discord Rich Presence", WIDGET_CVAR_CHECKBOX)
@@ -925,7 +937,7 @@ void PortMenu::AddMenuSettings() {
                      .DefaultValue(1));
 #endif
 
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !defined(BATTLESHIP_UWP)
     // Post-process / CRT shader stack — hidden on Android. The libretro
     // slang→SPIR-V→backend transpile path hasn't been validated against
     // GLES on mobile, and the libretro shader catalog download (curl +
@@ -951,7 +963,36 @@ void PortMenu::AddMenuSettings() {
         .Options(CheckboxOptions().Tooltip("Removes tearing, but can cap the game to the display refresh rate.")
                      .DefaultValue(true));
 
-#if !defined(__ANDROID__)
+    AddWidget(path, "Enhanced Framerate (Interpolated)", WIDGET_CVAR_COMBOBOX)
+        .CVar(PORT_INTERP_CVAR_FPS)
+        .RaceDisable(false)
+        .Callback([](WidgetInfo&) { portInterpApplyConfig(); })
+        .PreFunc([this](WidgetInfo& info) {
+            if (disabledMap.at(DISABLE_FOR_MATCH_REFRESH_RATE_ON).active) {
+                info.activeDisables.push_back(DISABLE_FOR_MATCH_REFRESH_RATE_ON);
+            }
+        })
+        .Options(ComboboxOptions()
+                     .Tooltip("Renders extra frames between 60 Hz game ticks by interpolating object "
+                              "and camera motion. Game logic, physics, and input timing stay at exactly "
+                              "60 Hz; only rendering is smoother. Adds up to one tick (16 ms) of visual "
+                              "latency. Requires a display refresh rate at or above the chosen value "
+                              "(or Vsync off) — if the host can't keep up, the game automatically steps "
+                              "back down to protect game speed.")
+                     .ComboMap(kEnhancedFpsMap)
+                     .DefaultIndex(0));
+
+    AddWidget(path, "Match Display Refresh Rate", WIDGET_CVAR_CHECKBOX)
+        .CVar(PORT_INTERP_CVAR_MATCH_DISPLAY)
+        .RaceDisable(false)
+        .Callback([](WidgetInfo&) { portInterpApplyConfig(); })
+        .Options(CheckboxOptions()
+                     .Tooltip("Locks interpolated rendering to the active display refresh rate, from 60 through "
+                              "240 Hz. Fractional frame cadence preserves the fixed 60 Hz game simulation on "
+                              "90/120/144/165 Hz phones, TVs, monitors, and Xbox display modes.")
+                     .DefaultValue(false));
+
+#if !defined(__ANDROID__) && !defined(BATTLESHIP_UWP)
     AddWidget(path, "Windowed Fullscreen", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_SDL_WINDOWED_FULLSCREEN)
         .RaceDisable(false)
@@ -1034,6 +1075,15 @@ void PortMenu::AddMenuSettings() {
             "Disables stage specific hazards such as moving platforms, tornadoes, Arwings, wind, etc."
             "Does not take effect mid-battle, only between battles.")
                      .DefaultValue(false));
+    AddWidget(path, "Bonus Stages", WIDGET_CVAR_CHECKBOX)
+        .CVar(ssb64::enhancements::BonusStagesCVarName())
+        .RaceDisable(false)
+        .Options(CheckboxOptions()
+                     .Tooltip("Shows the port-added bonus stage page (Final Destination, "
+                              "Metal Cavern, Battlefield) on the VS / Training stage select "
+                              "screen. Turn off for the original stage roster. Takes effect "
+                              "the next time the stage select screen opens.")
+                     .DefaultValue(true));
     AddWidget(path, "Debug", WIDGET_SEPARATOR_TEXT);
     AddWidget(path, "Hitbox View", WIDGET_CVAR_COMBOBOX)
         .CVar(enhancements::HitboxViewCVarName())
@@ -1114,6 +1164,13 @@ void PortMenu::AddMenuSettings() {
         .CVar(ssb64::enhancements::MusicSelectionCVarName())
         .RaceDisable(false)
         .Options(CheckboxOptions().Tooltip("Allows the player to pick a custom BGM track after the stage selection screen (music shuffling is ignored if this is turned on)."));
+
+    // --- Other ---
+    AddWidget(path, "Other", WIDGET_SEPARATOR_TEXT);
+        AddWidget(path, "Disable HUD", WIDGET_CVAR_CHECKBOX)
+        .CVar(ssb64::enhancements::DisableHUDCVarName())
+        .RaceDisable(false)
+        .Options(CheckboxOptions().Tooltip("Disables the in-game HUD. Note that some icons will still be visible (e.g. CPU icons in 1P Mode on the top-left.)"));
 
     // --- Input customization ---
     path.sidebarName = "Input Mappings";
@@ -1246,6 +1303,14 @@ void PortMenu::AddMenuSettings() {
         .Max(1.0f)
         .IsPercentage());
 
+    AddWidget(path, "Focus Behavior", WIDGET_SEPARATOR_TEXT);
+    AddWidget(path, "Mute on Focus Loss", WIDGET_CVAR_CHECKBOX)
+        .CVar("gSettings.FocusControl.MuteOnFocusLoss")
+        .RaceDisable(false)
+        .Options(CheckboxOptions()
+            .Tooltip("Silences game audio while the window is unfocused. Restores volume on refocus.")
+            .DefaultValue(false));
+
     // --- Cheats ---
     path.sidebarName = "Cheats";
     path.column = SECTION_COLUMN_1;
@@ -1336,6 +1401,23 @@ void PortMenu::AddMenuAssets() {
                                             "and substitutes a matching PNG from the mods/ index at the pack's higher "
                                             "resolution.")
                      .DefaultValue(ssb64::hires::kHiResEnabledDefault != 0));
+    AddWidget(path, "Preload Pack at Boot", WIDGET_CVAR_CHECKBOX)
+        .CVar("gHiResTextures.Preload")
+        .RaceDisable(false)
+        .Options(CheckboxOptions().Tooltip("Decodes the pack into RAM on background threads at startup so first use "
+                                            "of a texture doesn't stutter on a synchronous PNG decode. Warms up to "
+                                            "the cache budget below. Takes effect on next launch.")
+                     .DefaultValue(ssb64::hires::kHiResPreloadDefault != 0));
+    AddWidget(path, "Decoded Cache Budget (MB)", WIDGET_CVAR_SLIDER_INT)
+        .CVar("gHiResTextures.CacheBudgetMB")
+        .RaceDisable(false)
+        .Options(IntSliderOptions()
+                     .Tooltip("RAM budget for decoded pack textures. A large HD pack whose working set "
+                              "exceeds this re-decodes evicted textures on the render thread (stutter) — "
+                              "raise it if you have RAM to spare. Takes effect on next launch.")
+                     .Min(ssb64::hires::kMinLruBudgetMB)
+                     .Max(4096)
+                     .DefaultValue(ssb64::hires::kDefaultLruBudgetMB));
 #if defined(__ANDROID__)
     AddWidget(path,
               "Mobile note: decoded textures are uncompressed in RAM and on the GPU. "
@@ -1361,7 +1443,7 @@ void PortMenu::AddMenuAssets() {
     // Pack-authoring dump tooling is desktop-only — it writes hundreds of
     // files into <app>/ and is driven from a separate offline conversion
     // pipeline, neither of which makes sense on a touch device.
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !defined(BATTLESHIP_UWP)
     AddWidget(path, "Pack Authoring", WIDGET_SEPARATOR_TEXT);
     AddWidget(path,
               "Dump Source Textures writes one .bin per unique texture into "
@@ -1415,6 +1497,23 @@ void PortMenu::AddMenuAssets() {
 }
 
 #ifndef DISABLE_SCRIPTING
+// Cached, read-only mod list for the Mods panel. The set of installed mods
+// only changes on a reload or restart, so we snapshot on demand (first view,
+// Rescan, and after a Hot Reload) rather than re-scanning every frame.
+static std::vector<ssb64::mods::ModInfo> s_modList;
+static bool s_modListLoaded = false;
+
+static void RefreshModList() {
+    // Sync the mounted set to what's actually on disk so the list reflects mods
+    // added or deleted at runtime: drop archives whose folder is gone, pick up
+    // newly dropped ones. New mods appear as "not loaded" until a Hot Reload
+    // compiles them; this only refreshes the inventory, it does not recompile.
+    ssb64::UnmountMissingMods();
+    ssb64::MountModsDir();
+    s_modList = ssb64::mods::ModRegistry::Snapshot();
+    s_modListLoaded = true;
+}
+
 static void DoHotReload() {
     auto scripting = Ship::Context::GetInstance()->GetScriptLoader();
     if (!scripting) {
@@ -1432,9 +1531,12 @@ static void DoHotReload() {
             /*postExit=*/[](const std::string& mod) {
                 ssb64::mods::HookManager::UninstallHooksForOwner(mod.c_str());
             });
-        /* Pick up any new mod folders/archives that landed in mods/
-         * since the last load. Idempotent: already-mounted archives
-         * are skipped. */
+        /* Now that every script is unloaded, drop archives whose mod folder
+         * was deleted at runtime — otherwise it stays mounted and gets
+         * recompiled below as if it were still installed. Then pick up any
+         * new folders/archives that landed in mods/ since the last load
+         * (idempotent: already-mounted archives are skipped). */
+        ssb64::UnmountMissingMods();
         ssb64::MountModsDir();
         scripting->CompileAll();
         scripting->LoadAll(
@@ -1444,28 +1546,138 @@ static void DoHotReload() {
             /*postInit=*/[](const std::string&) {
                 ssb64::mods::HookManager::ClearCurrentOwner();
             });
+        RefreshModList();
     } catch (const std::exception& e) {
         SPDLOG_ERROR("Mod reload failed: {}", e.what());
     }
 }
 
 void PortMenu::AddMenuMods() {
-    AddMenuEntry("Mods", CVAR_SETTING("Menu.ModsSidebarSection"));
-
-    WidgetPath path = { "Mods", "Mods", SECTION_COLUMN_1 };
-    AddSidebarEntry("Mods", "Mods", 1);
+    WidgetPath path = { "Assets", "Script Mods", SECTION_COLUMN_1 };
+    AddSidebarEntry("Assets", "Script Mods", 1);
     AddWidget(path, "mods_panel", WIDGET_CUSTOM)
         .CustomFunction([](WidgetInfo&) {
+            // --- Action bar -------------------------------------------------
             if (ImGui::Button("Hot Reload")) {
-                DoHotReload();
+                DoHotReload(); // re-snapshots s_modList when it finishes
             }
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Unload + recompile + re-init all TCC mods.\n"
                                   "Adding or removing mod folders still needs an engine restart.");
             }
+            ImGui::SameLine();
+            if (ImGui::Button("Rescan")) {
+                RefreshModList();
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Re-read the mods/ folder without reloading the mods.");
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Open Mods Folder")) {
+                std::string modsPath = Ship::Context::GetPathRelativeToAppDirectory("mods");
+                std::error_code ec;
+                fs::create_directories(modsPath, ec);
+                SDL_OpenURL(std::string("file:///" + fs::absolute(modsPath).string()).c_str());
+            }
+
+            // Build the list once on first view; thereafter only on demand.
+            if (!s_modListLoaded) {
+                RefreshModList();
+            }
+
+            // --- Filter -----------------------------------------------------
+            static char filter[64] = "";
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputTextWithHint("##modfilter", "Filter by name or author", filter,
+                                     sizeof(filter));
+
             ImGui::Separator();
-            ImGui::TextWrapped("Mods are loaded from the mods/ folder next to the executable. "
-                               "Drop a folder or .o2r in there, then Hot Reload (or restart) to pick it up.");
+
+            if (s_modList.empty()) {
+                ImGui::TextWrapped("No mods found. Drop a mod folder or .o2r into the mods/ "
+                                   "folder next to the executable, then press Rescan (or "
+                                   "restart).");
+                return;
+            }
+
+            auto toLower = [](std::string s) {
+                std::transform(s.begin(), s.end(), s.begin(),
+                               [](unsigned char c) { return (char)std::tolower(c); });
+                return s;
+            };
+            const std::string needle = toLower(filter);
+            auto matches = [&](const ssb64::mods::ModInfo& mod) {
+                return needle.empty() ||
+                       toLower(mod.name).find(needle) != std::string::npos ||
+                       toLower(mod.author).find(needle) != std::string::npos;
+            };
+
+            // --- Mod cards --------------------------------------------------
+            int loadedCount = 0;
+            int issueCount = 0;
+            int shown = 0;
+            for (const auto& mod : s_modList) {
+                using ssb64::mods::ModState;
+                if (mod.state == ModState::Loaded) {
+                    loadedCount++;
+                }
+                if (mod.state == ModState::InvalidManifest) {
+                    issueCount++;
+                }
+                if (!matches(mod)) {
+                    continue;
+                }
+                shown++;
+
+                ImGui::PushID(mod.archivePath.c_str()); // unique id per card
+
+                switch (mod.state) {
+                    case ModState::Loaded:
+                        ImGui::TextColored(ImVec4(0.35f, 0.85f, 0.40f, 1.0f), "LOADED");
+                        break;
+                    case ModState::NotLoaded:
+                        ImGui::TextColored(ImVec4(0.65f, 0.65f, 0.65f, 1.0f), "not loaded");
+                        break;
+                    case ModState::InvalidManifest:
+                        ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.20f, 1.0f), "manifest issue");
+                        break;
+                }
+
+                ImGui::SameLine();
+                if (!mod.version.empty()) {
+                    ImGui::Text("%s  v%s", mod.name.c_str(), mod.version.c_str());
+                } else {
+                    ImGui::TextUnformatted(mod.name.c_str());
+                }
+                if (ImGui::IsItemHovered() && !mod.archivePath.empty()) {
+                    ImGui::SetTooltip("%s", mod.archivePath.c_str());
+                }
+
+                if (!mod.author.empty()) {
+                    ImGui::TextDisabled("by %s", mod.author.c_str());
+                }
+                if (!mod.description.empty()) {
+                    ImGui::TextWrapped("%s", mod.description.c_str());
+                }
+                if (!mod.note.empty()) {
+                    ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.20f, 1.0f), "%s", mod.note.c_str());
+                }
+
+                ImGui::PopID();
+                ImGui::Separator();
+            }
+
+            if (shown == 0) {
+                ImGui::TextDisabled("No mods match the filter.");
+            }
+
+            ImGui::Spacing();
+            std::string footer = std::to_string(static_cast<int>(s_modList.size())) +
+                                 " installed  |  " + std::to_string(loadedCount) + " loaded";
+            if (issueCount > 0) {
+                footer += "  |  " + std::to_string(issueCount) + " issue(s)";
+            }
+            ImGui::TextUnformatted(footer.c_str());
         });
 }
 #endif
@@ -1496,7 +1708,7 @@ void PortMenu::AddMenuAbout() {
     AddWidget(path, "Zorkats: C Modding Documentation", WIDGET_TEXT);
 
 
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !defined(BATTLESHIP_UWP)
     // BUILT-IN UPDATER — hidden on Android. App updates come through the
     // Play Store on mobile; a curl-driven GitHub-releases updater can't
     // replace a system-managed installation, and the curl shell-out
@@ -1620,8 +1832,8 @@ void PortMenu::InitElement() {
            },
             "Not available on DirectX" } },
         { DISABLE_FOR_MATCH_REFRESH_RATE_ON,
-          { [](disabledInfo&) -> bool { return CVarGetInteger(CVAR_SETTING("MatchRefreshRate"), 0); },
-            "Match Refresh Rate is enabled" } },
+          { [](disabledInfo&) -> bool { return CVarGetInteger(PORT_INTERP_CVAR_MATCH_DISPLAY, 0); },
+            "Match Display Refresh Rate is enabled" } },
         { DISABLE_FOR_ADVANCED_RESOLUTION_ON,
           { [](disabledInfo&) -> bool { return CVarGetInteger(CVAR_PREFIX_ADVANCED_RESOLUTION ".Enabled", 0); },
             "Advanced Resolution enabled" } },
@@ -1679,7 +1891,7 @@ void PortMenu::DrawElement() {
     }
 
     RenderPostProcessLowResWarnModal();
-#if !defined(__ANDROID__)
+#if !defined(__ANDROID__) && !defined(BATTLESHIP_UWP)
     RenderShaderPackModal();
 #endif
 }
