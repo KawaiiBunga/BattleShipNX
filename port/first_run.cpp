@@ -25,6 +25,14 @@
 #include <windows.h>
 #endif
 
+#ifdef SSB64_ONDEVICE_EXTRACT
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <imgui_impl_sdl2.h>
+#include "switch/torch_extract.h"
+#endif
+
 namespace fs = std::filesystem;
 
 // Region the binary was compiled for (see CMake REGION_US/REGION_JP).
@@ -111,7 +119,7 @@ std::string TryOpenLogPath(const fs::path& candidate) {
     // with exit 1 before torch runs. GetPathRelativeToAppDirectory()
     // returns "./logs/…" on macOS in portable mode, which is what
     // tripped this.
-    fs::path absolute = fs::absolute(candidate, ec);
+    fs::path absolute = fs::absolute(candidate, ec).lexically_normal();
     if (ec || absolute.empty()) {
         return candidate.string();
     }
@@ -136,6 +144,7 @@ ExtractionResult BuildFailure(const std::string& error, const std::string& logPa
     return { false, {}, error, logPath };
 }
 
+#ifndef SSB64_ONDEVICE_EXTRACT
 std::string QuoteCommandArg(const std::string& arg) {
 #ifdef _WIN32
     /* CreateProcessA argv parsing: double quotes, escape embedded quotes. */
@@ -164,6 +173,7 @@ std::string QuoteCommandArg(const std::string& arg) {
     return quoted;
 #endif
 }
+#endif // !SSB64_ONDEVICE_EXTRACT
 
 std::string ResolveLogPath(const std::string& preferredLogPath, const std::string& sourceDir,
                            const std::string& destinationDir) {
@@ -184,6 +194,7 @@ std::string ResolveLogPath(const std::string& preferredLogPath, const std::strin
     return {};
 }
 
+#ifndef SSB64_ONDEVICE_EXTRACT
 std::string FindTorchExecutable() {
     std::vector<std::string> candidates;
     for (const auto& base : {
@@ -293,6 +304,7 @@ bool RunTorchCommand(const std::string& commandLine, const std::string& workingD
     return true;
 #endif
 }
+#endif // !SSB64_ONDEVICE_EXTRACT
 
 // Locate the directory that contains config.yml (the integrated extraction
 // config plus yamls/us/*.yml recipes used by standalone Torch.
@@ -306,7 +318,7 @@ std::string FindAssetConfigDir() {
         fs::path dir = root;
         while (!dir.empty()) {
             if (fs::exists(dir / "config.yml") && fs::exists(dir / "yamls" / kRegion)) {
-                return dir.string();
+                return dir.lexically_normal().string();
             }
 
             const fs::path parent = dir.parent_path();
@@ -336,13 +348,44 @@ std::string FindBaseRom() {
     }
 
     std::error_code ec;
-    const fs::path absolute = fs::absolute(fs::path(found), ec);
+    const fs::path absolute = fs::absolute(fs::path(found), ec).lexically_normal();
     if (!ec) {
         return absolute.string();
     }
 
     return found;
 }
+
+#ifdef SSB64_ONDEVICE_EXTRACT
+/* Present while Torch is writing the archive in place; if it survives to the
+ * next boot, the extraction was interrupted and the archive is incomplete. */
+fs::path PartialMarkerPath(const fs::path& o2rPath) {
+    return fs::path(o2rPath.string() + ".partial");
+}
+
+/* Assets exported so far by the in-process extractor; the wizard polls it
+ * for the progress line. */
+std::atomic<size_t> sExtractedAssetCount{ 0 };
+
+/* Every .z64/.n64/.v64 in the app folder, whatever it's named — console
+ * users can't easily rename files, so don't insist on baserom.us.z64. */
+std::vector<std::string> ScanForRoms() {
+    std::vector<std::string> roms;
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(Ship::Context::GetAppDirectoryPath(), ec)) {
+        if (!entry.is_regular_file(ec)) {
+            continue;
+        }
+        std::string ext = entry.path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
+        if (ext == ".z64" || ext == ".n64" || ext == ".v64") {
+            roms.push_back(entry.path().string());
+        }
+    }
+    std::sort(roms.begin(), roms.end());
+    return roms;
+}
+#endif
 
 void DrawWizardFrame(const std::function<void()>& drawContents) {
     auto context = Ship::Context::GetInstance();
@@ -363,7 +406,7 @@ void DrawWizardFrame(const std::function<void()>& drawContents) {
 ExtractionResult ExtractAssetsIfNeeded(const std::string& target_o2r_path, bool silent,
                                        const std::string& romOverridePath) {
     std::error_code ec;
-    const fs::path absoluteTargetPath = fs::absolute(fs::path(target_o2r_path), ec);
+    const fs::path absoluteTargetPath = fs::absolute(fs::path(target_o2r_path), ec).lexically_normal();
     const fs::path targetPath = ec ? fs::path(target_o2r_path) : absoluteTargetPath;
     bool staleRecipe = false;
     if (fs::exists(targetPath)) {
@@ -372,6 +415,27 @@ ExtractionResult ExtractAssetsIfNeeded(const std::string& target_o2r_path, bool 
          * has its own asset sentinel) and the staged ROM is deleted after
          * extraction, so a recipe re-extract could never succeed here. */
         return { true, targetPath.string(), {}, {} };
+#elif defined(SSB64_ONDEVICE_EXTRACT)
+        if (fs::exists(PartialMarkerPath(targetPath), ec)) {
+            /* A previous extraction was interrupted (app closed mid-way);
+             * the archive is incomplete. Drop it and let the wizard redo it. */
+            port_log("first_run: %s is from an interrupted extraction; removing it\n",
+                     targetPath.string().c_str());
+            fs::remove(targetPath, ec);
+            fs::remove(PartialMarkerPath(targetPath), ec);
+            ec.clear();
+        } else {
+            /* On-device extraction takes minutes, so never re-extract silently
+             * behind a black boot screen. Archives are usually copied over from
+             * a PC without their .recipe sidecar anyway; deleting
+             * BattleShip.o2r brings the wizard back. */
+            if (ReadRecipeSidecar(targetPath) != SSB64_ASSET_RECIPE_HASH) {
+                port_log("first_run: %s recipe differs from this build; keeping it "
+                         "(delete it to re-extract on the console)\n",
+                         targetPath.string().c_str());
+            }
+            return { true, targetPath.string(), {}, {} };
+        }
 #else
         const std::string have = ReadRecipeSidecar(targetPath);
         if (have == SSB64_ASSET_RECIPE_HASH) {
@@ -389,6 +453,14 @@ ExtractionResult ExtractAssetsIfNeeded(const std::string& target_o2r_path, bool 
         port_log("first_run: %s missing — running asset extraction\n",
                  target_o2r_path.c_str());
     }
+
+#ifdef SSB64_ONDEVICE_EXTRACT
+    /* The boot-time auto attempt passes no ROM. Hand over to the wizard,
+     * which shows progress, instead of extracting behind a black screen. */
+    if (romOverridePath.empty()) {
+        return { false, {}, "ROM not selected", {} };
+    }
+#endif
 
     std::string rom = romOverridePath.empty() ? FindBaseRom() : romOverridePath;
     if (rom.empty()) {
@@ -417,7 +489,7 @@ ExtractionResult ExtractAssetsIfNeeded(const std::string& target_o2r_path, bool 
     }
 
     ec.clear();
-    const fs::path absoluteRomPath = fs::absolute(fs::path(rom), ec);
+    const fs::path absoluteRomPath = fs::absolute(fs::path(rom), ec).lexically_normal();
     if (!ec) {
         rom = absoluteRomPath.string();
     }
@@ -430,15 +502,32 @@ ExtractionResult ExtractAssetsIfNeeded(const std::string& target_o2r_path, bool 
     }
     port_log("first_run: asset config dir -> %s\n", cfgDir.c_str());
 
+#ifndef SSB64_ONDEVICE_EXTRACT
     const std::string torchExe = FindTorchExecutable();
     if (torchExe.empty()) {
         port_log("first_run: ERROR could not locate torch executable\n");
         return { false, {}, "Could not locate torch executable", {} };
     }
     port_log("first_run: torch executable -> %s\n", torchExe.c_str());
+#endif
 
     fs::create_directories(targetPath.parent_path());
-    const fs::path workDir = fs::absolute(targetPath.parent_path() / "torch-work");
+#ifdef SSB64_ONDEVICE_EXTRACT
+    /* No staging copy on the console: the app folder already holds
+     * config.yml + yamls/ and is writable, so Torch reads from cfgDir and
+     * writes straight into the archive's folder. (Creating a work directory
+     * there also fails with EINVAL through std::filesystem on Switch.) The
+     * .partial marker flags the archive as incomplete until Torch finishes. */
+    const fs::path outDir = targetPath.parent_path();
+    // cfgDir is typically "." here; Torch canonicalizes paths under it, so
+    // hand it an absolute one (torch_extract strips the sdmc: device).
+    const std::string srcDir = fs::absolute(cfgDir, ec).lexically_normal().string();
+    const std::string runDir = outDir.string();
+    std::ofstream(PartialMarkerPath(targetPath).string(), std::ios::trunc) << "extracting\n";
+    port_log("first_run: extracting from %s into %s\n", srcDir.c_str(), runDir.c_str());
+#else
+    const fs::path workDir = fs::absolute(targetPath.parent_path() / "torch-work").lexically_normal();
+    const fs::path& outDir = workDir;
     fs::remove_all(workDir, ec);
     ec.clear();
     fs::create_directories(workDir, ec);
@@ -462,8 +551,10 @@ ExtractionResult ExtractAssetsIfNeeded(const std::string& target_o2r_path, bool 
         port_log("first_run: ERROR could not stage yamls/: %s\n", ec.message().c_str());
         return { false, {}, "Could not stage yamls/: " + ec.message(), {} };
     }
+    const std::string srcDir = workDir.string();
     const std::string runDir = workDir.string();
     port_log("first_run: torch work dir -> %s\n", runDir.c_str());
+#endif
 
     const std::string preferredLogPath = Ship::Context::GetPathRelativeToAppDirectory("logs/asset-extract.log");
     const std::string logPath = ResolveLogPath(preferredLogPath, cfgDir, runDir);
@@ -471,14 +562,27 @@ ExtractionResult ExtractAssetsIfNeeded(const std::string& target_o2r_path, bool 
         std::ofstream truncate(logPath, std::ios::trunc);
     }
 
+    std::string commandError;
+#ifdef SSB64_ONDEVICE_EXTRACT
+    AppendLogLine(logPath, "In-process extraction: rom=" + rom + " src=" + srcDir + " dst=" + runDir);
+    sExtractedAssetCount = 0;
+    const bool extracted = TorchExtractO2R(rom, srcDir, runDir, logPath, sExtractedAssetCount, commandError);
+#else
     const std::string commandLine = QuoteCommandArg(torchExe) + " o2r " + QuoteCommandArg(rom) +
                                     " -s " + QuoteCommandArg(runDir) + " -d " + QuoteCommandArg(runDir);
     port_log("first_run: > %s\n", commandLine.c_str());
     AppendLogLine(logPath, "Command: " + commandLine);
 
-    std::string commandError;
-    if (!RunTorchCommand(commandLine, runDir, logPath, commandError)) {
+    const bool extracted = RunTorchCommand(commandLine, runDir, logPath, commandError);
+#endif
+    if (!extracted) {
         port_log("first_run: ERROR extractor failed: %s\n", commandError.c_str());
+#ifdef SSB64_ONDEVICE_EXTRACT
+        // Torch wrote into the live folder; don't leave a partial archive.
+        fs::remove(outDir / "BattleShip.o2r", ec);
+        fs::remove(PartialMarkerPath(targetPath), ec);
+        ec.clear();
+#endif
         if (staleRecipe) {
             /* Re-extraction failed but the previous archive is untouched —
              * keep running on it rather than blocking the user. */
@@ -502,7 +606,7 @@ ExtractionResult ExtractAssetsIfNeeded(const std::string& target_o2r_path, bool 
 
     // Torch emits with the historical "BattleShip.o2r" name; the port
     // renames into the per-region SSB64_O2R_NAME below.
-    const std::string emitted = (workDir / "BattleShip.o2r").string();
+    const std::string emitted = (outDir / "BattleShip.o2r").lexically_normal().string();
     if (!fs::exists(emitted)) {
         port_log("first_run: ERROR extractor reported success but %s is missing\n",
                  emitted.c_str());
@@ -514,7 +618,11 @@ ExtractionResult ExtractAssetsIfNeeded(const std::string& target_o2r_path, bool 
         return { false, {}, "Torch reported success but " SSB64_O2R_NAME " is missing", logPath };
     }
 
-    fs::rename(emitted, targetPath, ec);
+    ec.clear();
+    // On Switch Torch may already have written the final path (US name).
+    if (emitted != targetPath.string()) {
+        fs::rename(emitted, targetPath, ec);
+    }
     if (ec) {
         ec.clear();
         fs::copy_file(emitted, targetPath, fs::copy_options::overwrite_existing, ec);
@@ -525,7 +633,11 @@ ExtractionResult ExtractAssetsIfNeeded(const std::string& target_o2r_path, bool 
         }
     }
 
+#ifdef SSB64_ONDEVICE_EXTRACT
+    fs::remove(PartialMarkerPath(targetPath), ec);
+#else
     fs::remove_all(workDir, ec);
+#endif
 
     WriteRecipeSidecar(targetPath);
 
@@ -550,6 +662,35 @@ bool RunFirstRunWizard(const std::string& target_o2r_path) {
     char romPath[1024] = {0};
     std::snprintf(romPath, sizeof(romPath), "%s/%s.z64",
                   appData.c_str(), kRomBase);
+
+#ifdef SSB64_ONDEVICE_EXTRACT
+    // The controller is the only input here, but libultraship brings up
+    // SDL's game-controller subsystem later, in osInit (libultra/os.cpp).
+    // Until then SDL reports no pads and ImGui gets no navigation input.
+    // SDL_InitSubSystem is ref-counted, so the later SDL_Init is unaffected;
+    // the resulting CONTROLLERDEVICEADDED events make the ImGui backend
+    // pick the pads up.
+    if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0) {
+        port_log("first_run: WARNING SDL game controller init failed: %s\n", SDL_GetError());
+    }
+    // The backend already enumerated (zero) pads at startup; make it re-scan
+    // now rather than relying only on the device-added events.
+    ImGui_ImplSDL2_SetGamepadMode(ImGui_ImplSDL2_GamepadMode_AutoFirst);
+
+    // No file picker or drag-drop on a console: offer whatever ROMs sit in
+    // the app folder and let the controller pick one.
+    std::error_code dirEc;
+    const std::string romDir = fs::absolute(appData, dirEc).lexically_normal().string();
+    std::vector<std::string> foundRoms = ScanForRoms();
+    int selectedRomIndex = 0;
+    auto selectRom = [&](int index) {
+        selectedRomIndex = index;
+        if (index >= 0 && index < (int)foundRoms.size()) {
+            std::snprintf(romPath, sizeof(romPath), "%s", foundRoms[index].c_str());
+        }
+    };
+    selectRom(0);
+#endif
 
     enum class State { WaitingForRom, Extracting, Done, Cancelled };
     State state = State::WaitingForRom;
@@ -600,7 +741,8 @@ bool RunFirstRunWizard(const std::string& target_o2r_path) {
             state = State::Cancelled;
             break;
         }
-        if (autoCancelFrame >= 0 && frameCount++ >= autoCancelFrame) {
+        // Counted every frame: it also drives the progress-bar animation.
+        if (frameCount++ >= autoCancelFrame && autoCancelFrame >= 0) {
             port_log("first_run: SSB64_WIZARD_AUTOCANCEL fired at frame %d\n",
                      frameCount);
             state = State::Cancelled;
@@ -619,6 +761,12 @@ bool RunFirstRunWizard(const std::string& target_o2r_path) {
             }
             fdm->ClearDroppedFile();
         }
+
+#ifdef SSB64_ONDEVICE_EXTRACT
+        // The wizard runs before the menu exists, so Gui never turns on
+        // gamepad navigation for us; the controller is the only input.
+        ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+#endif
 
         DrawWizardFrame([&] {
             ImGui::OpenPopup("First-run setup");
@@ -642,6 +790,23 @@ bool RunFirstRunWizard(const std::string& target_o2r_path) {
                     kRomDesc);
                 ImGui::Separator();
 
+#ifdef SSB64_ONDEVICE_EXTRACT
+                ImGui::TextWrapped("ROMs in %s:", dirEc ? appData.c_str() : romDir.c_str());
+                if (foundRoms.empty()) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "No ROM found.");
+                    ImGui::TextWrapped("Copy your ROM (.z64, .n64 or .v64) into that folder, "
+                                       "then choose Rescan.");
+                } else {
+                    for (int i = 0; i < (int)foundRoms.size(); i++) {
+                        const std::string name = fs::path(foundRoms[i]).filename().string();
+                        if (ImGui::Selectable(name.c_str(), selectedRomIndex == i)) {
+                            selectRom(i);
+                            statusMsg.clear();
+                        }
+                    }
+                }
+                ImGui::Spacing();
+#else
                 ImGui::Text("ROM path:");
                 // InputText takes most of the row, Browse takes the right
                 // edge. -100 reserves room for a 90 px button + padding.
@@ -666,10 +831,18 @@ bool RunFirstRunWizard(const std::string& target_o2r_path) {
                 ImGui::TextDisabled(
                     "     Browse... and pick your ROM dump.");
                 ImGui::Spacing();
+#endif
 
                 if (state == State::Extracting) {
+#ifdef SSB64_ONDEVICE_EXTRACT
+                    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f),
+                                       "Extracting assets (%zu done). This takes a few "
+                                       "minutes; keep the app open.",
+                                       sExtractedAssetCount.load());
+#else
                     ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f),
                                        "Extracting assets — please wait...");
+#endif
                     // Indeterminate progress bar. Extraction does not emit
                     // progress callbacks, so we animate a marquee-style
                     // fraction that loops every ~2 s. ImGui doesn't
@@ -688,7 +861,21 @@ bool RunFirstRunWizard(const std::string& target_o2r_path) {
                 const bool busy = (state == State::Extracting);
                 ImGui::BeginDisabled(busy);
 
+#ifdef SSB64_ONDEVICE_EXTRACT
+                ImGui::BeginDisabled(foundRoms.empty());
+                const bool extractPressed = ImGui::Button("Extract", ImVec2(120, 0));
+                ImGui::EndDisabled();
+                ImGui::SetItemDefaultFocus();
+                ImGui::SameLine();
+                if (ImGui::Button("Rescan", ImVec2(120, 0))) {
+                    foundRoms = ScanForRoms();
+                    selectRom(0);
+                    statusMsg.clear();
+                }
+                if (extractPressed) {
+#else
                 if (ImGui::Button("Extract", ImVec2(120, 0))) {
+#endif
                     if (!fs::exists(romPath)) {
                         statusMsg = "ROM not found at that path.";
                     } else {

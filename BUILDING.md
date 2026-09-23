@@ -77,7 +77,18 @@ it with `-G "Visual Studio 17 2022" -T v143` if a runner has several.
 
 ## Nintendo Switch
 
-Nintendo Switch builds require the [devkitPro](https://devkitpro.org/) toolchain with `devkitA64` and `libnx` installed.
+Nintendo Switch builds require the [devkitPro](https://devkitpro.org/) toolchain with `devkitA64`, `libnx` and the Switch portlibs (`switch-sdl2`, `switch-mesa`, `switch-zlib`, `switch-tinyxml2`) installed, plus Python 3 with Pillow. The easiest route is the official `devkitpro/devkita64` Docker image, which ships all of them:
+
+```bash
+docker run --rm -v "$PWD:/src" -w /src devkitpro/devkita64 bash -c \
+  "apt-get update && apt-get install -y python3-pil && git config --global --add safe.directory '*' && \
+   cmake -S . -B build-switch -DCMAKE_TOOLCHAIN_FILE=/opt/devkitpro/cmake/Switch.cmake -DSSB64_VERSION=us && \
+   cmake --build build-switch -j 4"
+```
+
+The Switch-specific libultraship changes live in `patches/libultraship-switch.patch`; configure applies them to the `libultraship` submodule automatically (so `git status` shows it as modified afterwards — that's expected).
+
+To build natively instead:
 
 1. Ensure your devkitPro environment variables are set.
 2. From an MSYS2 or Linux shell, configure using the Switch toolchain file:

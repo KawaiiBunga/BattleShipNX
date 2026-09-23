@@ -1,0 +1,337 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 7f2e09ae..c0caac7c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -46,6 +46,10 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
+     include(cmake/dependencies/ios.cmake)
+ endif()
+ 
++if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++    include(cmake/dependencies/switch.cmake)
++endif()
++
+ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+     include(cmake/dependencies/linux.cmake)
+ endif()
+diff --git a/cmake/dependencies/common.cmake b/cmake/dependencies/common.cmake
+index 03b994fb..0007c867 100644
+--- a/cmake/dependencies/common.cmake
++++ b/cmake/dependencies/common.cmake
+@@ -126,7 +126,7 @@ endif()
+ # Heavy first-build cost (~10-20s extra link), so default OFF on the mobile
+ # targets that don't yet have a CRT-shader UI. Desktops get it ON so user
+ # .glsl drops Just Work cross-backend.
+-if (CMAKE_SYSTEM_NAME STREQUAL "iOS" OR CMAKE_SYSTEM_NAME STREQUAL "Android")
++if (CMAKE_SYSTEM_NAME MATCHES "iOS|Android|NintendoSwitch")
+     set(_LUS_PP_TRANSPILER_DEFAULT OFF)
+ else()
+     set(_LUS_PP_TRANSPILER_DEFAULT ON)
+@@ -204,7 +204,7 @@ FetchContent_MakeAvailable(prism)
+ # success but hid_enumerate() returns nullptr, so RaphnetPhysicalDeviceManager
+ # decides "no adapter found" and the SDL2 / Java HIDDeviceManager handles
+ # everything that's actually present.
+-if (CMAKE_SYSTEM_NAME STREQUAL "Android")
++if (CMAKE_SYSTEM_NAME MATCHES "Android|NintendoSwitch")
+     set(_LUS_HIDAPI_STUB_DIR ${CMAKE_CURRENT_BINARY_DIR}/hidapi_stub)
+     file(MAKE_DIRECTORY ${_LUS_HIDAPI_STUB_DIR})
+     file(WRITE ${_LUS_HIDAPI_STUB_DIR}/hidapi.h [=[
+diff --git a/cmake/dependencies/git-patch.cmake b/cmake/dependencies/git-patch.cmake
+index deb3e35d..8fb51253 100644
+--- a/cmake/dependencies/git-patch.cmake
++++ b/cmake/dependencies/git-patch.cmake
+@@ -2,7 +2,7 @@
+ 
+ function(patch)
+     execute_process(
+-        COMMAND git apply ${patch_file}
++        COMMAND git apply --ignore-whitespace --whitespace=nowarn ${patch_file}
+         RESULT_VARIABLE ret
+         ERROR_QUIET
+     )
+@@ -11,7 +11,7 @@ endfunction()
+ 
+ function(check_patch)
+     execute_process(
+-        COMMAND git apply --reverse --check ${patch_file}
++        COMMAND git apply --reverse --check --ignore-whitespace --whitespace=nowarn ${patch_file}
+         RESULT_VARIABLE ret
+         ERROR_QUIET
+     )
+diff --git a/cmake/dependencies/switch.cmake b/cmake/dependencies/switch.cmake
+new file mode 100644
+index 00000000..ae8588ae
+--- /dev/null
++++ b/cmake/dependencies/switch.cmake
+@@ -0,0 +1,87 @@
++include(FetchContent)
++
++# Nintendo Switch (devkitA64 + libnx). SDL2, Mesa (EGL/GLESv2/glapi/drm_nouveau),
++# tinyxml2 and zlib come from devkitPro portlibs; everything portlibs lacks is
++# fetched and built statically, mirroring android.cmake.
++
++#=================== SDL2 ===================
++find_package(SDL2 REQUIRED)
++
++#=================== nlohmann-json ===================
++find_package(nlohmann_json QUIET)
++if (NOT ${nlohmann_json_FOUND})
++    FetchContent_Declare(
++        nlohmann_json
++        GIT_REPOSITORY https://github.com/nlohmann/json.git
++        GIT_TAG v3.12.0
++        OVERRIDE_FIND_PACKAGE
++    )
++    FetchContent_MakeAvailable(nlohmann_json)
++endif()
++
++#=================== tinyxml2 ===================
++# Always fetched rather than taken from portlibs: the game links Torch into
++# the same binary, and Torch FetchContent's tinyxml2 too. Declaring it here
++# first makes Torch's declaration a no-op, so both share one copy instead of
++# colliding at link time.
++set(tinyxml2_BUILD_TESTING OFF)
++FetchContent_Declare(
++    tinyxml2
++    GIT_REPOSITORY https://github.com/leethomason/tinyxml2.git
++    GIT_TAG 11.0.0
++    OVERRIDE_FIND_PACKAGE
++)
++FetchContent_MakeAvailable(tinyxml2)
++if (NOT TARGET tinyxml2::tinyxml2)
++    add_library(tinyxml2::tinyxml2 ALIAS tinyxml2)
++endif()
++
++#=================== spdlog ===================
++find_package(spdlog QUIET)
++if (NOT ${spdlog_FOUND})
++    FetchContent_Declare(
++        spdlog
++        GIT_REPOSITORY https://github.com/gabime/spdlog.git
++        GIT_TAG v1.16.0
++        OVERRIDE_FIND_PACKAGE
++    )
++    FetchContent_MakeAvailable(spdlog)
++endif()
++
++#=================== libzip ===================
++find_package(libzip QUIET)
++if (NOT ${libzip_FOUND})
++    set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
++    set(BUILD_TOOLS OFF)
++    set(BUILD_REGRESS OFF)
++    set(BUILD_EXAMPLES OFF)
++    set(BUILD_DOC OFF)
++    set(BUILD_OSSFUZZ OFF)
++    set(BUILD_SHARED_LIBS OFF)
++    # Only deflate (zlib) is needed for .o2r archives; keep the other codecs
++    # and crypto backends out so nothing probes for libs libnx doesn't have.
++    set(ENABLE_BZIP2 OFF)
++    set(ENABLE_LZMA OFF)
++    set(ENABLE_ZSTD OFF)
++    set(ENABLE_OPENSSL OFF)
++    set(ENABLE_GNUTLS OFF)
++    set(ENABLE_MBEDTLS OFF)
++    set(ENABLE_COMMONCRYPTO OFF)
++    set(ENABLE_WINDOWS_CRYPTO OFF)
++    FetchContent_Declare(
++        libzip
++        GIT_REPOSITORY https://github.com/nih-at/libzip.git
++        GIT_TAG v1.11.4
++        OVERRIDE_FIND_PACKAGE
++    )
++    FetchContent_MakeAvailable(libzip)
++    list(APPEND ADDITIONAL_LIB_INCLUDES ${libzip_SOURCE_DIR}/lib ${libzip_BINARY_DIR})
++endif()
++
++#=================== ImGui ===================
++# Mesa's GLES3/EGL headers live in portlibs, which the toolchain file does not
++# put on the include path; SDL2's config only adds include/SDL2.
++target_include_directories(ImGui SYSTEM PUBLIC ${DEVKITPRO}/portlibs/switch/include)
++# Static-link order matters: GLESv2 -> EGL -> glapi -> drm_nouveau -> nx.
++target_link_libraries(ImGui PUBLIC SDL2::SDL2 GLESv2 EGL glapi drm_nouveau nx)
++add_compile_definitions(IMGUI_IMPL_OPENGL_ES3)
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 936b8b4c..9c0684f5 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -84,12 +84,12 @@ target_link_libraries(libultraship PRIVATE hidapi::hidapi)
+ #   * Linux/BSD: use the system libusb-1.0 (pkg-config) when present.
+ #   * Everything else (Windows, macOS, or Linux without libusb-dev): build libusb
+ #     statically from libusb-cmake, so no DLL/dylib needs to ship with the game.
+-#   * Not available on Android, iOS or the UWP/Xbox build (no raw USB access).
++#   * Not available on Android, iOS, Switch or the UWP/Xbox build (no raw USB access).
+ # On Windows the adapter must be bound to the WinUSB driver (e.g. via Zadig or
+ # Dolphin's driver installer) for libusb to open it.
+ option(LUS_GCADAPTER "Native GameCube adapter support (libusb)" ON)
+ option(LUS_GCADAPTER_FETCH_LIBUSB "Always build libusb from source instead of using the system one" OFF)
+-if (LUS_GCADAPTER AND NOT CMAKE_SYSTEM_NAME STREQUAL "Android" AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS"
++if (LUS_GCADAPTER AND NOT CMAKE_SYSTEM_NAME MATCHES "Android|iOS|NintendoSwitch"
+     AND NOT BATTLESHIP_UWP)
+     set(_LUS_LIBUSB_TARGET "")
+     if (NOT LUS_GCADAPTER_FETCH_LIBUSB AND (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME MATCHES "BSD"))
+diff --git a/src/fast/backends/gfx_opengl.cpp b/src/fast/backends/gfx_opengl.cpp
+index 8a627507..9973ab99 100644
+--- a/src/fast/backends/gfx_opengl.cpp
++++ b/src/fast/backends/gfx_opengl.cpp
+@@ -736,7 +736,7 @@ void GfxRenderingAPIOGL::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, size
+ }
+ 
+ void GfxRenderingAPIOGL::Init() {
+-#if !defined(__linux__) && !defined(__OpenBSD__)
++#if !defined(__linux__) && !defined(__OpenBSD__) && !defined(__SWITCH__) && !defined(USE_OPENGLES)
+     glewInit();
+ #endif
+ 
+diff --git a/src/fast/interpreter.cpp b/src/fast/interpreter.cpp
+index 7541f37e..1a1420fd 100644
+--- a/src/fast/interpreter.cpp
++++ b/src/fast/interpreter.cpp
+@@ -2,7 +2,23 @@
+ 
+ #ifdef _WIN32
+ #include <windows.h>
+-#else
++#elif defined(__SWITCH__)
++// libnx's <switch/types.h> typedefs u64/s64 as (unsigned) long, which clashes
++// with libultra's long long typedefs, so declare the one SVC used here locally.
++// Layout mirrors libnx's MemoryInfo (switch/kernel/svc.h).
++#include <stdint.h>
++struct LusNxMemoryInfo {
++    uint64_t addr;
++    uint64_t size;
++    uint32_t type;
++    uint32_t attr;
++    uint32_t perm;
++    uint32_t ipc_refcount;
++    uint32_t device_refcount;
++    uint32_t padding;
++};
++extern "C" uint32_t svcQueryMemory(LusNxMemoryInfo* meminfo_ptr, uint32_t* pageinfo, uint64_t addr);
++#elif !defined(__wiiu__)
+ #include <dlfcn.h>
+ #include <sys/mman.h>
+ #include <unistd.h>
+@@ -312,6 +328,8 @@ bool gfxPointerInLoadedModule(const void* ptr) {
+     // leftover (0x01000000, 0x0E000000, ...) would land "inside a module"
+     // and the SETTIMG/G_VTX guards would never fire.
+     return mod != nullptr && mod != GetModuleHandleA(nullptr);
++#elif defined(__SWITCH__) || defined(__wiiu__)
++    return false;
+ #else
+     // Same main-image exclusion as Windows. On Linux the port links
+     // non-PIE, so the executable itself owns the sub-256MB VA range that
+@@ -479,6 +497,26 @@ bool gfxPointerHasReadableBytes(const void* ptr, size_t size) {
+         cursor += available;
+     }
+ 
++    return true;
++#elif defined(__SWITCH__)
++    // Horizon has no mincore(2); ask the kernel for each region's permissions.
++    uintptr_t cursor = reinterpret_cast<uintptr_t>(ptr);
++    uintptr_t end = cursor + size;
++    constexpr uint32_t kMemTypeUnmapped = 0x00; // MemType_Unmapped
++    constexpr uint32_t kPermR = 1u << 0;        // Perm_R
++    while (cursor < end) {
++        LusNxMemoryInfo info = {};
++        uint32_t pageInfo = 0;
++        if (svcQueryMemory(&info, &pageInfo, cursor) != 0 || info.type == kMemTypeUnmapped ||
++            (info.perm & kPermR) == 0) {
++            return false;
++        }
++        uintptr_t regionEnd = static_cast<uintptr_t>(info.addr + info.size);
++        if (regionEnd <= cursor) {
++            return false;
++        }
++        cursor = regionEnd;
++    }
+     return true;
+ #else
+     // POSIX: probe with mincore(2) — it fails with ENOMEM when any page in
+diff --git a/src/ship/scripting/LibraryLoader.cpp b/src/ship/scripting/LibraryLoader.cpp
+index 5de8a5e3..116cdae9 100644
+--- a/src/ship/scripting/LibraryLoader.cpp
++++ b/src/ship/scripting/LibraryLoader.cpp
+@@ -8,10 +8,9 @@
+ 
+ #if defined(_WIN32) || defined(__CYGWIN__)
+ #include <windows.h>
+-#else
++#elif !defined(__SWITCH__)
+ #include <dlfcn.h>
+ #include <unistd.h>
+-#include <unistd.h>
+ #include <fcntl.h>
+ #include <cerrno>
+ #endif
+@@ -59,6 +58,8 @@ std::string LibraryLoader::GenerateTempFile() {
+     close(fd);
+     return std::string(pathTemplate);
+ 
++#elif defined(__SWITCH__)
++    return "";
+ #else
+ #error "Unsupported Operating System"
+ #endif
+@@ -157,6 +158,8 @@ void LibraryLoader::Init(const std::string& path) {
+     }
+ 
+     unlink(path.c_str());
++#elif defined(__SWITCH__)
++    throw std::runtime_error("Dynamic libraries are not supported on Nintendo Switch");
+ #else
+ #error "Unsupported Operating System"
+ #endif
+@@ -173,6 +176,8 @@ void* LibraryLoader::GetFunction(const std::string& name) {
+     }
+ #if defined(_WIN32) || defined(__CYGWIN__)
+     return (void*)GetProcAddress((HMODULE)mHandle, name.c_str());
++#elif defined(__SWITCH__)
++    return nullptr;
+ #else
+     return (void*)dlsym(mHandle, name.c_str());
+ #endif
+diff --git a/src/ship/window/FileDropMgr.cpp b/src/ship/window/FileDropMgr.cpp
+index a401d19a..9f97114e 100644
+--- a/src/ship/window/FileDropMgr.cpp
++++ b/src/ship/window/FileDropMgr.cpp
+@@ -11,7 +11,7 @@
+ #endif
+ #include "ship/Context.h"
+ #include "ship/window/Window.h"
+-#ifdef __unix__
++#if defined(__unix__) && !defined(__SWITCH__)
+ #include <dlfcn.h>
+ #include <cxxabi.h>
+ #endif
+@@ -50,7 +50,7 @@ char* FileDropMgr::GetDroppedFile() const {
+ }
+ 
+ static void PrintRegError(void* funcAddr) {
+-#ifdef __unix__
++#if defined(__unix__) && !defined(__SWITCH__)
+     Dl_info info;
+     int gotAddress = dladdr(funcAddr, &info);
+     const char* nameFound = info.dli_sname;
+diff --git a/src/ship/window/gui/Gui.cpp b/src/ship/window/gui/Gui.cpp
+index f73ed3af..0c642961 100644
+--- a/src/ship/window/gui/Gui.cpp
++++ b/src/ship/window/gui/Gui.cpp
+@@ -535,8 +535,7 @@ void Gui::DrawMenu() {
+     ImGui::DockSpace(dockId, ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_None | ImGuiDockNodeFlags_NoDockingInCentralNode);
+ 
+     if (ImGui::IsKeyPressed(TOGGLE_BTN, false) || ImGui::IsKeyPressed(ImGuiKey_Escape, false) ||
+-        (ImGui::IsKeyPressed(TOGGLE_PAD_BTN, false) &&
+-         Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_IMGUI_CONTROLLER_NAV, 0))) {
++        ImGui::IsKeyPressed(TOGGLE_PAD_BTN, false)) {
+         if ((ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(TOGGLE_PAD_BTN, false)) && GetMenu()) {
+             GetMenu()->ToggleVisibility();
+         } else if ((ImGui::IsKeyPressed(TOGGLE_BTN, false) || ImGui::IsKeyPressed(TOGGLE_PAD_BTN, false)) &&
+@@ -544,7 +543,7 @@ void Gui::DrawMenu() {
+             GetMenuBar()->ToggleVisibility();
+         }
+         Ship::Context::GetInstance()->GetWindow()->GetMouseStateManager()->UpdateMouseCapture();
+-        if (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_IMGUI_CONTROLLER_NAV, 0) &&
++        if ((Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_IMGUI_CONTROLLER_NAV, 0) || ImGui::IsKeyPressed(TOGGLE_PAD_BTN, false)) &&
+             GetMenuOrMenubarVisible()) {
+             mImGuiIo->ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+         } else {

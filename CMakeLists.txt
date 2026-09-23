@@ -32,6 +32,9 @@ endif()
 if (CMAKE_SYSTEM_NAME MATCHES "NintendoSwitch")
     # Nintendo Switch libnx lacks waitpid/execvp needed by ImGui's shell fallback
     add_compile_definitions(IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS)
+    # newlib hides POSIX/GNU extensions (fileno, putc_unlocked, ...) under
+    # strict -std=c++NN, which spdlog/fmt force via CXX_EXTENSIONS OFF.
+    add_compile_definitions(_GNU_SOURCE)
 endif()
 
 # Mod system master switch (TinyCC source scripting + funchook hook backend +
@@ -162,10 +165,10 @@ endif()
 # Android ships Torch as a SHARED library (libtorch_runner.so) inside the
 # APK so the first-run UI can extract the user's ROM on-device via JNI —
 # see the torch_runner target at the bottom of this file.
-if (CMAKE_SYSTEM_NAME STREQUAL "Android")
+if (CMAKE_SYSTEM_NAME MATCHES "Android|NintendoSwitch")
+    # Android and Switch link Torch in as a static library and drive it
+    # in-process (a console can't spawn the sidecar executable).
     set(USE_STANDALONE OFF CACHE BOOL "" FORCE)
-elseif (CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
-    # Switch does not build torch; it relies on PC extraction.
 else()
     set(USE_STANDALONE ON CACHE BOOL "" FORCE)
 endif()
@@ -190,6 +193,34 @@ endif()
 ################################################################################
 # Subdirectories: libultraship
 ################################################################################
+
+# Switch: libultraship stays pinned to the upstream submodule commit; the
+# Switch-specific changes (switch.cmake, dlfcn/glew guards, pad menu toggle,
+# GC-adapter opt-out) live in patches/libultraship-switch.patch and are applied
+# to the submodule checkout here. Idempotent: skipped once already applied.
+if (CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+    find_package(Git REQUIRED)
+    set(_LUS_SWITCH_PATCH ${CMAKE_CURRENT_SOURCE_DIR}/patches/libultraship-switch.patch)
+    set(_LUS_GIT_APPLY ${GIT_EXECUTABLE} -C ${CMAKE_CURRENT_SOURCE_DIR}/libultraship
+        apply --ignore-whitespace --whitespace=nowarn)
+    execute_process(
+        COMMAND ${_LUS_GIT_APPLY} --reverse --check ${_LUS_SWITCH_PATCH}
+        RESULT_VARIABLE _lus_patch_applied
+        OUTPUT_QUIET ERROR_QUIET
+    )
+    if (NOT _lus_patch_applied EQUAL 0)
+        execute_process(
+            COMMAND ${_LUS_GIT_APPLY} ${_LUS_SWITCH_PATCH}
+            RESULT_VARIABLE _lus_patch_result
+            ERROR_VARIABLE _lus_patch_error
+        )
+        if (NOT _lus_patch_result EQUAL 0)
+            message(FATAL_ERROR "Failed to apply ${_LUS_SWITCH_PATCH} to libultraship "
+                "(was the submodule bumped?):\n${_lus_patch_error}")
+        endif()
+        message(STATUS "Applied libultraship Switch patch")
+    endif()
+endif()
 
 add_subdirectory(libultraship ${CMAKE_BINARY_DIR}/libultraship)
 
@@ -258,9 +289,16 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Android")
     # bottom of this file wraps it for JNI.
     add_subdirectory(torch ${CMAKE_BINARY_DIR}/torch)
 elseif (CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
-    # Switch: no Torch built. Rely on PC for extraction.
-    set(TORCH_EXECUTABLE "torch")
-    set(TORCH_SIDECAR_NAME torch)
+    # Switch: Torch is linked straight into the NRO so the first-run wizard
+    # can extract BattleShip.o2r on the console (see port/first_run.cpp).
+    add_subdirectory(torch ${CMAKE_BINARY_DIR}/torch)
+    # Torch and libultraship both define a global `StringHelper` with
+    # different implementations. Linked into one static binary, the linker
+    # would silently resolve Torch's calls to libultraship's copy, so give
+    # Torch's its own name.
+    foreach(_torch_target torch BinaryTools N64Graphics)
+        target_compile_definitions(${_torch_target} PUBLIC StringHelper=TorchStringHelper)
+    endforeach()
 else()
     # Desktop: build Torch as a host executable via ExternalProject so it
     # can run at our build time to extract ROM assets.
@@ -549,6 +587,9 @@ list(APPEND SSB64_SRC_PORT
 # coroutine_test.cpp has its own main(); only built standalone when
 # SSB64_BUILD_COROUTINE_TEST=ON below. Never link it into the game.
 list(FILTER SSB64_SRC_PORT EXCLUDE REGEX "port/coroutine_test\\.cpp$")
+# Built separately as ssb64_torch_bridge (Switch only) so Torch's include
+# dirs never reach the rest of the port.
+list(FILTER SSB64_SRC_PORT EXCLUDE REGEX "port/switch/torch_extract\\.cpp$")
 # port/mods/ (HookManager + SymbolResolver) wraps funchook, which isn't
 # fetched when the mod system is disabled. Drop it so nothing references the
 # missing backend. port/hooks/ (the event dispatch system) is funchook-free
@@ -825,6 +866,13 @@ target_include_directories(ssb64_game PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/libultraship/include
 )
 
+if (CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+    # decomp/include/stddef.h shadows the toolchain's, so newlib's
+    # `#define __need_wint_t / #include <stddef.h>` never gets wint_t.
+    target_compile_options(ssb64_game PRIVATE
+        -include ${CMAKE_CURRENT_SOURCE_DIR}/port/switch/newlib_compat.h)
+endif()
+
 # Clang 16+ promoted several historically-warning diagnostics to errors by
 # default, which breaks the decomp C code on macOS/Linux. The decomp was
 # written against IDO 7.1 and relies on implicit function declarations, loose
@@ -996,6 +1044,15 @@ endif()
 if (CMAKE_SYSTEM_NAME MATCHES "Android|NintendoSwitch")
     add_dependencies(${PROJECT_NAME} libultraship)
     target_link_libraries(${PROJECT_NAME} PRIVATE libultraship)
+    if (CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+        # On-device ROM extraction for the first-run wizard. Torch's headers
+        # clash with libultraship's (both define a global StringHelper), so
+        # only this one TU sees them.
+        add_library(ssb64_torch_bridge STATIC port/switch/torch_extract.cpp)
+        target_link_libraries(ssb64_torch_bridge PRIVATE torch)
+        target_link_libraries(${PROJECT_NAME} PRIVATE ssb64_torch_bridge)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE SSB64_ONDEVICE_EXTRACT=1)
+    endif()
 elseif(BATTLESHIP_UWP)
     add_dependencies(${PROJECT_NAME} libultraship TorchExternal)
     target_link_libraries(${PROJECT_NAME} PRIVATE libultraship SDL2 LIBUWP GLFW3)
@@ -1290,10 +1347,11 @@ endif()
 ################################################################################
 # Asset extraction targets (desktop only — Android extracts on-device from
 # the user's ROM via libtorch_runner.so at first launch; see
-# port/android_torch_bridge.cpp + RomImporter.java).
+# port/android_torch_bridge.cpp + RomImporter.java. Switch extracts on-device
+# through the first-run wizard with Torch linked into the NRO).
 ################################################################################
 
-if (NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
+if (NOT CMAKE_SYSTEM_NAME MATCHES "Android|NintendoSwitch")
 # Accept .z64 (big-endian), .n64 (little-endian), or .v64 (byteswapped).
 # Torch's Cartridge::Normalize converts non-z64 byte orders in-memory.
 set(SSB64_BASEROM "")
